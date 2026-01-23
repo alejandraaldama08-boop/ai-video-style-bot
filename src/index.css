@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 4%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 6%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 6%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 270 100% 65%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 10% 12%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 10% 15%;
+    --muted-foreground: 240 5% 65%;
+    --accent: 180 100% 50%;
+    --accent-foreground: 240 10% 4%;
+    --destructive: 0 85% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 10% 18%;
+    --input: 240 10% 18%;
+    --ring: 270 100% 65%;
+    --radius: 0.75rem;
+    
+    /* Custom neon colors */
+    --neon-purple: 270 100% 65%;
+    --neon-cyan: 180 100% 50%;
+    --neon-pink: 330 100% 65%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-card/50 backdrop-blur-xl border border-border/50;
+  }
+  
+  .gradient-text {
+    @apply bg-gradient-to-r from-neon-purple via-neon-cyan to-neon-pink bg-clip-text text-transparent;
+  }
+  
+  .neon-border {
+    @apply border border-neon-purple/50 shadow-[0_0_20px_hsl(var(--neon-purple)/0.3)];
+  }
+}
