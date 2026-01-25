@@ -9,6 +9,22 @@ app.use(express.json({ limit: "50mb" }));
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "render-backend", message: "Online ✅" });
 });
+app.post("/generate", (req, res) => {
+  const { prompt } = req.body;
+
+  if (!prompt) {
+    return res.status(400).json({
+      ok: false,
+      error: "No prompt provided"
+    });
+  }
+
+  res.json({
+    ok: true,
+    receivedPrompt: prompt,
+    message: "Generate endpoint working 🚀"
+  });
+});
 
 app.get("/health", (req, res) => {
   // probamos que ffmpeg existe
