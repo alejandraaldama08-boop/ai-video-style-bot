@@ -15,21 +15,17 @@ export async function generateVideo(config: any): Promise<RenderJob> {
     body: JSON.stringify(config),
   });
 
-  if (!response.ok) {
-    throw new Error('Failed to start render job');
-  }
-
+  if (!response.ok) throw new Error('Failed to start render job');
   return response.json();
 }
 
 export async function getRenderStatus(jobId: string): Promise<RenderJob> {
   const response = await fetch(`${API_URL}/status/${jobId}`);
-  if (!response.ok) {
-    throw new Error('Failed to get render status');
-  }
+
+  if (!response.ok) throw new Error('Failed to get render status');
   return response.json();
 }
 
-export function getDownloadUrl(jobId: string) {
+export async function getDownloadUrl(jobId: string): Promise<string> {
   return `${API_URL}/download/${jobId}`;
 }
