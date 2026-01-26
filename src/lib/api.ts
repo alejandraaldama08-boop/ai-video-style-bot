@@ -1,190 +1,170 @@
 // src/lib/api.ts
-// API client for Render backend (ai-video-style-bot-3)
-
+// API configuration for Render backend
 const API_URL =
-  import.meta.env.VITE_API_URL || "https://ai-video-style-bot-3.onrender.com";
+  (import.meta as any).env?.VITE_API_URL ||
+  "https://ai-video-style-bot-3.onrender.com";
+
+export type RenderStatus = "pending" | "rendering" | "done" | "error";
 
 export interface RenderJob {
   jobId: string;
-  status: "pending" | "rendering" | "done" | "error";
+  status: RenderStatus;
   progress?: number;
   downloadUrl?: string;
   error?: string;
 }
 
-export interface VideoConfig {
-  clips: ClipInput[];
-  music?: MusicInput;
-  youtubeLinks?: YouTubeInput[];
-  style: VideoStyle;
-  duration: number;
-  format: "tiktok" | "reels" | "youtube";
-  overlays: TextOverlay[];
-  subtitles?: SubtitleConfig;
-}
-
 export interface ClipInput {
   id: string;
-  url: string;
-  name: string;
+  url?: string;        // puede ser blob: o http(s)
+  file?: File;         // si lo tienes en memoria (recomendado)
+  name?: string;
   startTime?: number;
   endTime?: number;
-  order: number;
+  order?: number;
 }
 
 export interface MusicInput {
-  url: string;
-  name: string;
-  volume: number;
-  fadeIn: boolean;
-  fadeOut: boolean;
-}
-
-export interface YouTubeInput {
-  url: string;
-  startTime?: number;
-  endTime?: number;
-}
-
-export interface VideoStyle {
-  name: "cinematic" | "vlog" | "street" | "elegant" | "dynamic";
-  transitions: boolean;
-  zoom: boolean;
-  beatSync: boolean;
+  url?: string;        // blob: o http(s)
+  file?: File;
+  name?: string;
+  volume?: number;
 }
 
 export interface TextOverlay {
   text: string;
-  position: "top" | "center" | "bottom";
-  style: "modern" | "minimal" | "bold";
+  start?: number;
+  end?: number;
+  position?: "center" | "top" | "bottom";
 }
 
 export interface SubtitleConfig {
   enabled: boolean;
-  style: "modern" | "minimal" | "bold";
+  language?: string;
 }
 
-// Helpers
-function makeJobId() {
-  return crypto.randomUUID();
+export interface VideoConfig {
+  clips: ClipInput[];
+  music?: MusicInput;
+  youtubeLinks?: string[];
+  style?: any;
+  duration?: number;
+  format?: "tiktok" | "reels" | "youtube";
+  overlays?: TextOverlay[];
+  subtitles?: SubtitleConfig;
+  plan?: any;
 }
 
-function normalizeError(err: unknown): string {
-  if (err instanceof Error) return err.message;
+function joinUrl(base: string, path: string) {
+  if (!base) return path;
+  if (base.endsWith("/") && path.startsWith("/")) return base + path.slice(1);
+  if (!base.endsWith("/") && !path.startsWith("/")) return base + "/" + path;
+  return base + path;
+}
+
+async function parseJsonSafe(res: Response) {
+  const text = await res.text();
   try {
-    return JSON.stringify(err);
+    return JSON.parse(text);
   } catch {
-    return String(err);
+    return { ok: false, error: text || `HTTP ${res.status}` };
   }
 }
 
-// API functions
-export async function checkHealth(): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_URL}/health`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+async function uploadToBackend(file: File): Promise<string> {
+  const fd = new FormData();
+  fd.append("file", file);
 
-/**
- * Start render.
- * Tu backend actual genera un MP4 en POST /render y devuelve { ok: true, url }.
- * Aquí lo transformamos a RenderJob con status 'done' y downloadUrl = url del mp4.
- */
-export async function generateVideo(config: VideoConfig): Promise<RenderJob> {
-  try {
-    // En esta fase "mock-real": el backend no usa clips aún.
-    // Para probar pipeline, mandamos un texto y segundos basado en duration.
-    const seconds = Math.max(1, Math.min(Number(config?.duration) || 3, 10));
-
-    // Si quieres que el texto cambie, lo puedes mejorar luego.
-    const text =
-      (config?.overlays?.[0]?.text ||
-        `Video ${config.format} (${config.style?.name || "style"})`) ?? "Hola";
-
-    const res = await fetch(`${API_URL}/render`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        seconds,
-        // dejamos el config completo por si luego lo usas en backend
-        config,
-      }),
-    });
-
-    const data = await res.json().catch(() => null);
-
-    if (!res.ok) {
-      throw new Error(data?.error || "Failed to start render job");
-    }
-
-    // Backend devuelve { ok: true, url, message }
-    const url: string | undefined = data?.url;
-
-    if (!url) {
-      throw new Error("Render response did not include a video url");
-    }
-
-    return {
-      jobId: makeJobId(),
-      status: "done",
-      progress: 100,
-      downloadUrl: url,
-    };
-  } catch (err) {
-    return {
-      jobId: makeJobId(),
-      status: "error",
-      error: normalizeError(err),
-    };
-  }
-}
-
-/**
- * Status polling (tu backend aún no tiene /status/:jobId real).
- * Por ahora devolvemos 'done' si existe downloadUrl o 'error' si no.
- * (Esto evita que PreviewPanel se quede esperando.)
- */
-export async function getRenderStatus(jobId: string): Promise<RenderJob> {
-  // Si luego implementas /status/:jobId en backend, cambia esto:
-  // const res = await fetch(`${API_URL}/status/${jobId}`) ...
-  return {
-    jobId,
-    status: "done",
-    progress: 100,
-  };
-}
-
-/**
- * Download URL helper.
- * Tu backend real ahora devuelve un mp4 directo en /out/...mp4,
- * así que PreviewPanel debe usar downloadUrl directo.
- * Si implementas /download/:jobId en backend, aquí lo conectas.
- */
-export async function getDownloadUrl(jobId: string): Promise<string> {
-  return `${API_URL}/download/${jobId}`;
-}
-
-/**
- * Upload file (tu backend aún no tiene /upload).
- * Lo dejamos para después. Si no lo usas, no pasa nada.
- */
-export async function uploadFile(file: File): Promise<string> {
-  const formData = new FormData();
-  formData.append("file", file);
-
-  const res = await fetch(`${API_URL}/upload`, {
+  const res = await fetch(joinUrl(API_URL, "/upload"), {
     method: "POST",
-    body: formData,
+    body: fd,
   });
 
-  if (!res.ok) {
-    throw new Error("Failed to upload file");
+  const data = await parseJsonSafe(res);
+  if (!res.ok || !data?.ok || !data?.url) {
+    throw new Error(data?.error || "Upload failed");
+  }
+  return data.url as string;
+}
+
+/**
+ * Convierte un clip en URL pública:
+ * - Si ya es http(s) => se deja igual
+ * - Si es blob: => requiere file (o fallará)
+ * - Si hay file => se sube al backend y se devuelve URL pública
+ */
+async function ensurePublicUrl(input: { url?: string; file?: File }, label: string): Promise<string> {
+  const url = input.url;
+
+  // Si ya es pública
+  if (url && /^https?:\/\//i.test(url)) return url;
+
+  // Si hay file, subimos (sirve para blob: o url vacía)
+  if (input.file) {
+    return await uploadToBackend(input.file);
   }
 
-  const data = await res.json();
-  return data.url;
+  // Si llega blob: pero sin File => no hay manera de que el backend lo lea
+  if (url && url.startsWith("blob:")) {
+    throw new Error(
+      `${label} es blob: (local del navegador). Necesito el File para subirlo a /upload.`
+    );
+  }
+
+  throw new Error(`${label} no tiene url pública ni File para subir.`);
+}
+
+export async function healthCheck() {
+  const res = await fetch(joinUrl(API_URL, "/health"));
+  const data = await parseJsonSafe(res);
+  if (!res.ok) throw new Error(data?.error || "Health check failed");
+  return data;
+}
+
+export async function renderVideo(config: VideoConfig): Promise<{ ok: true; url: string; message?: string }>{
+  // 1) Asegurar clips en URL pública
+  const clips = await Promise.all(
+    (config.clips || []).map(async (c, idx) => {
+      const publicUrl = await ensurePublicUrl(
+        { url: c.url, file: c.file },
+        `Clip ${idx + 1}`
+      );
+
+      return {
+        ...c,
+        url: publicUrl,
+      };
+    })
+  );
+
+  // 2) Asegurar música si existe
+  let music: any = undefined;
+  if (config.music) {
+    const musicUrl = await ensurePublicUrl(
+      { url: config.music.url, file: config.music.file },
+      "Música"
+    );
+    music = { ...config.music, url: musicUrl };
+  }
+
+  // 3) Llamar a /render con URLs públicas
+  const payload = {
+    ...config,
+    clips,
+    music,
+  };
+
+  const res = await fetch(joinUrl(API_URL, "/render"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await parseJsonSafe(res);
+  if (!res.ok || !data?.ok) {
+    throw new Error(data?.error || "Render failed");
+  }
+
+  // backend devuelve {ok:true, url: ".../out/....mp4"}
+  return data;
 }
