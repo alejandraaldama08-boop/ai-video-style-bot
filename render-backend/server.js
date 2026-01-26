@@ -4,10 +4,13 @@ import fs from "fs";
 import path from "path";
 import { exec } from "child_process";
 import { fileURLToPath } from "url";
+import multer from "multer";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "200mb" }));
+
+// JSON solo para endpoints que lo usan
+app.use(express.json({ limit: "50mb" }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,22 +19,43 @@ const OUT_DIR = path.join(__dirname, "out");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 app.use("/out", express.static(OUT_DIR));
 
+// Multer: guarda archivos subidos en /out
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, OUT_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || ".mp4") || ".mp4";
+    cb(null, `upload-${Date.now()}${ext}`);
+  },
+});
+const upload = multer({ storage });
+
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "render-backend", message: "Online ✅" });
 });
 
-app.get("/health", async (req, res) => {
-  res.json({ ok: true });
+/**
+ * POST /upload
+ * form-data:
+ * - file: (video)
+ * devuelve: { ok:true, url:"https://.../out/upload-xxx.mp4" }
+ */
+app.post("/upload", upload.single("file"), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: "No file uploaded (field name must be 'file')" });
+    }
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const url = `${baseUrl}/out/${req.file.filename}`;
+    res.json({ ok: true, url, filename: req.file.filename });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "Upload failed", details: String(e?.message || e) });
+  }
 });
 
-// Descarga una URL a un archivo local
-async function downloadToFile(url, destPath) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Download failed ${r.status}: ${r.statusText}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  fs.writeFileSync(destPath, buf);
-}
-
+/**
+ * POST /render
+ * body: { clips:[{url:"https://.../out/upload-xxx.mp4"}], format:"reels"|"tiktok"|"youtube" }
+ */
 app.post("/render", async (req, res) => {
   try {
     const clipUrl = req.body?.clips?.[0]?.url;
@@ -39,37 +63,36 @@ app.post("/render", async (req, res) => {
     if (!clipUrl) {
       return res.status(400).json({ ok: false, error: "Missing clips[0].url" });
     }
-
-    // Si Lovable manda blob: esto NO se puede renderizar en servidor
     if (String(clipUrl).startsWith("blob:")) {
       return res.status(400).json({
         ok: false,
-        error:
-          "Lovable is sending a blob: URL (local browser URL). Backend cannot access it. You must upload the file and send a public http(s) URL.",
+        error: "Got blob: URL. You must upload first to /upload and pass the returned http(s) URL into /render.",
         got: clipUrl,
       });
     }
 
     const id = Date.now();
-    const input = path.join(OUT_DIR, `input-${id}.mp4`);
-    const output = path.join(OUT_DIR, `render-${id}.mp4`);
+    const inputPath = path.join(OUT_DIR, `input-${id}.mp4`);
+    const outputPath = path.join(OUT_DIR, `render-${id}.mp4`);
 
-    // Descargamos primero a local (esto evita problemas de ffmpeg leyendo https directo)
-    await downloadToFile(clipUrl, input);
+    // Descarga la URL http(s) a local (por si es externa)
+    const r = await fetch(clipUrl);
+    if (!r.ok) throw new Error(`Download failed ${r.status}: ${r.statusText}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    fs.writeFileSync(inputPath, buf);
 
     // Render vertical 1080x1920
     const cmd =
-      `ffmpeg -y -i "${input}" ` +
+      `ffmpeg -y -i "${inputPath}" ` +
       `-vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" ` +
       `-c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -movflags +faststart ` +
-      `"${output}"`;
+      `"${outputPath}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (err, stdout, stderr) => {
       if (err) {
         return res.status(500).json({
           ok: false,
           error: "FFmpeg failed",
-          // Lo importante: el motivo real
           details: String(stderr || stdout || err.message).slice(0, 2000),
         });
       }
@@ -81,13 +104,9 @@ app.post("/render", async (req, res) => {
       });
     });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "Render handler crashed",
-      details: String(e?.message || e).slice(0, 2000),
-    });
+    res.status(500).json({ ok: false, error: "Render crashed", details: String(e?.message || e).slice(0, 2000) });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Render backend listening on", PORT));
+app.listen(PORT, () => console.log("render-backend listening on", PORT));
