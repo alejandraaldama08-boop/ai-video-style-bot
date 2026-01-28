@@ -3,219 +3,264 @@ import cors from "cors";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
-import { spawn } from "child_process";
-import { pipeline } from "stream/promises";
-import { Readable } from "stream";
+import os from "os";
 import { fileURLToPath } from "url";
+import { execFile } from "child_process";
+import https from "https";
+import http from "http";
 
+const app = express();
+app.use(express.json({ limit: "50mb" }));
+
+// -----------------------------
+// CORS (MUY IMPORTANTE)
+// -----------------------------
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Permite llamadas sin origin (health checks, curl, etc.)
+    if (!origin) return cb(null, true);
+
+    const isVercel = /^https:\/\/.*\.vercel\.app$/.test(origin);
+    const isLocalhost = /^http:\/\/localhost:\d+$/.test(origin);
+    const isRender = /^https:\/\/.*\.onrender\.com$/.test(origin);
+
+    if (isVercel || isLocalhost || isRender) return cb(null, true);
+
+    return cb(new Error("Not allowed by CORS: " + origin), false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // <-- preflight global
+
+// -----------------------------
+// Paths / storage
+// -----------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+// Render puede ser read-only en algunas rutas; si falla, usa /tmp
+function ensureDir(p) {
+  try {
+    fs.mkdirSync(p, { recursive: true });
+    return p;
+  } catch (e) {
+    return null;
+  }
+}
+let finalUploadDir = ensureDir(UPLOAD_DIR);
+if (!finalUploadDir) {
+  finalUploadDir = ensureDir(path.join(os.tmpdir(), "uploads"));
+}
+if (!finalUploadDir) {
+  throw new Error("No se pudo crear carpeta de uploads.");
+}
 
-// ====== Config ======
-const PORT = process.env.PORT || 3000;
-const TMP_DIR = process.env.TMP_DIR || "/tmp";
-const OUT_DIR = process.env.OUT_DIR || path.join(__dirname, "out");
+// Servir archivos subidos como públicos
+app.use("/uploads", express.static(finalUploadDir, { maxAge: "1h" }));
 
-// crea carpetas
-fs.mkdirSync(TMP_DIR, { recursive: true });
-fs.mkdirSync(OUT_DIR, { recursive: true });
-
-// CORS + JSON
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-
-// sirve outputs
-app.use("/out", express.static(OUT_DIR));
-
-// ====== Multer upload ======
-const upload = multer({
-  dest: TMP_DIR,
-  limits: { fileSize: 800 * 1024 * 1024 }, // 800MB
+// -----------------------------
+// Multer
+// -----------------------------
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, finalUploadDir),
+  filename: (_req, file, cb) => {
+    const safe = file.originalname.replace(/[^\w.\-]+/g, "_");
+    cb(null, `${Date.now()}-${safe}`);
+  },
 });
 
-// ====== Helpers ======
-function nowId() {
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+// límite 200MB por archivo (ajústalo si quieres)
+const upload = multer({
+  storage,
+  limits: { fileSize: 200 * 1024 * 1024 },
+});
+
+// -----------------------------
+// Helpers
+// -----------------------------
+function getBaseUrl(req) {
+  // En Render detrás de proxy, usa x-forwarded-proto/host
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${proto}://${host}`;
 }
 
-function safeName(name = "file") {
-  return name.replace(/[^\w.\-]+/g, "_");
-}
-
-async function getFfmpegVersion() {
-  return await new Promise((resolve) => {
-    const p = spawn("ffmpeg", ["-version"]);
-    let out = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (out += d.toString()));
-    p.on("close", () => resolve(out.split("\n")[0] || "ffmpeg"));
-    p.on("error", () => resolve("ffmpeg (not found)"));
+function execFFmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile("ffmpeg", args, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
+      if (err) {
+        return reject(new Error(stderr || err.message));
+      }
+      resolve({ stdout, stderr });
+    });
   });
 }
 
-async function downloadToFile(url, destPath) {
-  // Node 18+ tiene fetch global
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-
-  // Convertir WebStream a Node stream
-  const nodeStream =
-    res.body && typeof res.body.getReader === "function"
-      ? Readable.fromWeb(res.body)
-      : res.body; // por si ya fuese Node stream
-
-  if (!nodeStream) throw new Error("No response body to download");
-
-  await pipeline(nodeStream, fs.createWriteStream(destPath));
-  return destPath;
+function execFFprobe(args) {
+  return new Promise((resolve, reject) => {
+    execFile("ffprobe", args, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve({ stdout, stderr });
+    });
+  });
 }
 
-async function runFfmpeg(args) {
-  return await new Promise((resolve, reject) => {
-    const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+function downloadToFile(url, outPath) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https://") ? https : http;
 
-    let stderr = "";
-    p.stderr.on("data", (d) => (stderr += d.toString()));
+    const req = client.get(url, (res) => {
+      // Redirecciones
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return resolve(downloadToFile(res.headers.location, outPath));
+      }
 
-    p.on("close", (code) => {
-      if (code === 0) return resolve({ ok: true });
-      return reject(new Error(stderr || `ffmpeg exited with code ${code}`));
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Download failed ${res.statusCode} for ${url}`));
+      }
+
+      const fileStream = fs.createWriteStream(outPath);
+      res.pipe(fileStream);
+      fileStream.on("finish", () => fileStream.close(() => resolve(outPath)));
+      fileStream.on("error", reject);
     });
 
-    p.on("error", (err) => reject(err));
+    req.on("error", reject);
   });
 }
 
-// ====== Routes ======
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "render-backend", message: "Online ✅" });
+async function isUrlPublicHttp(url) {
+  return typeof url === "string" && /^https?:\/\/.+/i.test(url);
+}
+
+// -----------------------------
+// Routes
+// -----------------------------
+app.get("/health", async (_req, res) => {
+  try {
+    const { stdout } = await execFFprobe(["-version"]);
+    res.json({ ok: true, service: "render-backend", ffprobe: stdout.split("\n")[0] });
+  } catch (e) {
+    res.json({ ok: true, service: "render-backend", ffprobe: "not found", warning: String(e?.message || e) });
+  }
 });
 
-app.get("/health", async (req, res) => {
-  const ffmpeg = await getFfmpegVersion();
-  res.json({ ok: true, service: "render-backend", ffmpeg });
-});
-
-// Solo para que no te salga "Cannot GET /upload" en navegador
-app.get("/upload", (req, res) => {
-  res.json({
-    ok: true,
-    message: "Upload endpoint ready ✅. Use POST /upload (multipart/form-data, field: file)",
-  });
-});
-
-// POST /upload => devuelve URL pública /out/...
+// Subida: form-data con campo "file"
 app.post("/upload", upload.single("file"), (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
+    if (!req.file) return res.status(400).json({ ok: false, error: "No file received" });
 
-    const original = safeName(req.file.originalname || "upload.mp4");
-    const outName = `upload-${nowId()}-${original}`;
-    const outPath = path.join(OUT_DIR, outName);
+    const base = getBaseUrl(req);
+    const publicUrl = `${base}/uploads/${req.file.filename}`;
 
-    fs.renameSync(req.file.path, outPath);
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    return res.json({
+    res.json({
       ok: true,
-      url: `${baseUrl}/out/${outName}`,
-      name: req.file.originalname,
+      filename: req.file.filename,
+      originalname: req.file.originalname,
       size: req.file.size,
+      url: publicUrl,
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "Upload failed", details: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: "Upload failed", details: String(e?.message || e) });
   }
 });
 
 /**
- * POST /render
- * Body esperado (mínimo):
- * {
- *   "clips": [{ "url": "https://....mp4" }],
- *   "format": "reels" | "tiktok" | "youtube",
- *   "duration": 10 | 15 | 30 | 60
+ * Render:
+ * body: {
+ *   clips: [{ url: "https://....mp4" }, ...],
+ *   platform?: "tiktok"|"reels"|"youtube",
+ *   duration?: number
  * }
  */
-app.post("/render", async (req, res) => {
+app.post("/generate", async (req, res) => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clipforge-"));
   try {
-    const body = req.body || {};
-    const clips = Array.isArray(body.clips) ? body.clips : [];
-
-    if (!clips[0] || !clips[0].url) {
-      return res.status(400).json({
-        ok: false,
-        error: 'The one of all properties "expected body.clips[0].url"',
-      });
+    const { clips } = req.body || {};
+    if (!Array.isArray(clips) || clips.length === 0) {
+      return res.status(400).json({ ok: false, error: "Expected body.clips[]" });
     }
 
-    const clipUrl = clips[0].url;
-
-    // validar que sea http/https (no blob:)
-    if (!/^https?:\/\//i.test(clipUrl)) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Invalid clip url. Must be a public http(s) URL. (No blob: / local browser URLs)",
-        got: clipUrl,
-      });
+    // validar urls
+    for (const c of clips) {
+      if (!c?.url || !(await isUrlPublicHttp(c.url))) {
+        return res.status(400).json({
+          ok: false,
+          error: "Each clip must have a public http(s) url",
+          got: c?.url,
+        });
+      }
     }
 
-    const format = (body.format || "reels").toLowerCase();
-    const duration = Number(body.duration || 10);
-
-    // tamaños según formato
-    let targetW = 1080, targetH = 1920; // reels/tiktok
-    if (format === "youtube") {
-      targetW = 1920;
-      targetH = 1080;
+    // Descargar clips a /tmp
+    const downloaded = [];
+    for (let i = 0; i < clips.length; i++) {
+      const url = clips[i].url;
+      const out = path.join(tmpRoot, `clip-${i}.mp4`);
+      await downloadToFile(url, out);
+      downloaded.push(out);
     }
 
-    // paths temporales
-    const inPath = path.join(TMP_DIR, `in-${nowId()}.mp4`);
-    const outName = `render-${nowId()}.mp4`;
-    const outPath = path.join(OUT_DIR, outName);
+    // Crear concat list
+    const listPath = path.join(tmpRoot, "list.txt");
+    const listContent = downloaded.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
+    fs.writeFileSync(listPath, listContent);
 
-    // descargar clip
-    await downloadToFile(clipUrl, inPath);
+    // Output
+    const outName = `render-${Date.now()}.mp4`;
+    const outPath = path.join(finalUploadDir, outName);
 
-    // ffmpeg args: escala y recorta a tamaño target, limita duración y genera mp4
-    // -vf: scale + crop centrado (cover)
-    const vf = `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,crop=${targetW}:${targetH}`;
+    // Concatenar sin reencode si se puede; si falla, reencode
+    try {
+      await execFFmpeg([
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        listPath,
+        "-c",
+        "copy",
+        outPath,
+      ]);
+    } catch (_copyErr) {
+      // fallback reencode
+      await execFFmpeg([
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        listPath,
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        outPath,
+      ]);
+    }
 
-    const args = [
-      "-y",
-      "-i",
-      inPath,
-      "-t",
-      String(duration),
-      "-vf",
-      vf,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-crf",
-      "22",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
-      outPath,
-    ];
+    const base = getBaseUrl(req);
+    const publicUrl = `${base}/uploads/${outName}`;
 
-    await runFfmpeg(args);
-
-    // limpiar input temporal
-    try { fs.unlinkSync(inPath); } catch {}
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
     return res.json({
       ok: true,
-      status: "done",
-      downloadUrl: `${baseUrl}/out/${outName}`,
-      file: outName,
+      url: publicUrl,
+      filename: outName,
     });
   } catch (e) {
     return res.status(500).json({
@@ -223,10 +268,18 @@ app.post("/render", async (req, res) => {
       error: "FFmpeg failed",
       details: String(e?.message || e),
     });
+  } finally {
+    // limpiar tmp
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {}
   }
 });
 
-// ====== Start ======
+// -----------------------------
+// Start
+// -----------------------------
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
