@@ -25,7 +25,7 @@ export function ChatPanel({
   onPlan,
 }: {
   context: ChatContext;
-  onPlan: (planResponse: any) => void; // actualiza el plan global en el editor
+  onPlan: (planResponse: any) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     {
@@ -34,6 +34,7 @@ export function ChatPanel({
         "Pega aquí el estilo, referencias y lo que quieres. Luego envía y generaré un plan.",
     },
   ]);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,7 +42,7 @@ export function ChatPanel({
   const listRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, loading]);
 
   const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
@@ -56,9 +57,11 @@ export function ChatPanel({
     setLoading(true);
 
     try {
-      const res = await generatePlanFromChat([...messages, userMsg], context);
+      const res = await generatePlanFromChat(
+        [...messages, userMsg].filter((m) => m.role !== "system"),
+        context
+      );
 
-      // res puede venir como {success,message,plan} o directamente {plan:...}
       onPlan(res);
 
       setMessages((prev) => [
@@ -66,7 +69,7 @@ export function ChatPanel({
         {
           role: "assistant",
           content:
-            "Plan generado ✅. Revísalo en “Plan de Edición”. Si quieres, dime el estilo exacto (CapCut, football edits, etc.) y lo afino.",
+            "Plan generado ✅. Revísalo en el panel “Plan de Edición”. Dime qué cambiar y lo ajusto.",
         },
       ]);
     } catch (e: any) {
@@ -76,7 +79,7 @@ export function ChatPanel({
         {
           role: "assistant",
           content:
-            "He tenido un error al generar el plan. Revisa que el backend esté online y que la ruta /plan funcione.",
+            "Error generando el plan. Comprueba que tu backend tiene POST /plan y que VITE_API_URL está bien.",
         },
       ]);
     } finally {
@@ -123,7 +126,7 @@ export function ChatPanel({
           <Input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Describe qué quieres (estilo, ritmo, textos, etc.)"
+            placeholder="Describe el edit (estilo, ritmo, zooms, beat sync, textos...)"
             onKeyDown={(e) => {
               if (e.key === "Enter") handleSend();
             }}
