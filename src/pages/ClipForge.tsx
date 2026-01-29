@@ -30,10 +30,11 @@ type JobData = {
   url?: string;
 };
 
-const API_URL =
-  (import.meta as any).env?.VITE_API_URL ||
-  (import.meta as any).env?.VITE_API_BASE_URL ||
-  "http://localhost:3000";
+//
+// ✅ IMPORTANTE: Lovable no expone env vars como Vercel,
+// así que fijamos el backend aquí en HTTPS para evitar Mixed Content.
+//
+const API_URL = "https://ai-video-style-bot-3.onrender.com";
 
 // ---------- helpers ----------
 async function readJsonSafe(res: Response) {
@@ -57,11 +58,7 @@ async function uploadOne(file: File): Promise<UploadedFile> {
   const { json, text } = await readJsonSafe(res);
 
   if (!res.ok) {
-    const msg =
-      json?.error ||
-      json?.message ||
-      text ||
-      `Upload failed (${res.status})`;
+    const msg = json?.error || json?.message || text || `Upload failed (${res.status})`;
     throw new Error(msg);
   }
 
@@ -84,8 +81,7 @@ async function createRenderJob(payload: any): Promise<{ jobId: string }> {
   const { json, text } = await readJsonSafe(res);
 
   if (!res.ok) {
-    const msg =
-      json?.error || json?.message || text || `Render failed (${res.status})`;
+    const msg = json?.error || json?.message || text || `Render failed (${res.status})`;
     throw new Error(msg);
   }
 
@@ -105,10 +101,7 @@ async function pollJob(jobId: string): Promise<JobData> {
   return json || {};
 }
 
-async function generatePlan(
-  messages: { role: "user" | "assistant"; content: string }[],
-  context: any
-) {
+async function generatePlan(messages: { role: "user" | "assistant"; content: string }[], context: any) {
   const res = await fetch(`${API_URL}/plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -188,9 +181,7 @@ export default function ClipForge() {
       setClips((prev) => {
         const base = prev.slice();
         const startOrder = base.length;
-        return base.concat(
-          uploaded.map((c, idx) => ({ ...c, order: startOrder + idx }))
-        );
+        return base.concat(uploaded.map((c, idx) => ({ ...c, order: startOrder + idx })));
       });
     } catch (e: any) {
       setDebugMsg(`❌ Subida clips: ${e?.message || "Error subiendo clips"}`);
@@ -207,16 +198,19 @@ export default function ClipForge() {
     setDebugMsg("");
     setIsUploadingMusic(true);
     try {
-      // Debug: muestra qué estás intentando subir
       setDebugMsg(
-        `🎵 Intentando subir música: ${file.name} (${file.type || "sin mimetype"}, ${(file.size / 1024 / 1024).toFixed(2)} MB)`
+        `🎵 Intentando subir música: ${file.name} (${file.type || "sin mimetype"}, ${(file.size / 1024 / 1024).toFixed(
+          2
+        )} MB)`
       );
 
       const up = await uploadOne(file);
       setMusic(up);
 
       setDebugMsg(
-        `✅ Música subida: ${up.name} | mimetype=${up.mimetype || "?"} | size=${up.size ? (up.size / 1024 / 1024).toFixed(2) + "MB" : "?"}`
+        `✅ Música subida: ${up.name} | mimetype=${up.mimetype || "?"} | size=${
+          up.size ? (up.size / 1024 / 1024).toFixed(2) + "MB" : "?"
+        }`
       );
     } catch (e: any) {
       setDebugMsg(`❌ Subida música: ${e?.message || "Error subiendo música"}`);
@@ -235,6 +229,7 @@ export default function ClipForge() {
     try {
       const up = await uploadOne(file);
       setReferenceVideo(up);
+      setDebugMsg(`✅ Referencia subida: ${up.name || up.url}`);
     } catch (e: any) {
       setDebugMsg(`❌ Subida referencia: ${e?.message || "Error subiendo referencia"}`);
       alert(e?.message || "Error subiendo vídeo de referencia");
@@ -287,7 +282,7 @@ export default function ClipForge() {
         const data = await pollJob(newJobId);
         setLastJob(data);
 
-        if (data?.status === "done" || data?.status === "completed" || data?.outputUrl) {
+        if (data?.status === "done" || data?.status === "completed" || data?.outputUrl || data?.url) {
           const out = data?.outputUrl || data?.url;
           if (out) setOutputUrl(out);
           setJobStatus("done");
@@ -378,10 +373,10 @@ export default function ClipForge() {
 
         {/* Right: Inputs + Chat */}
         <div className="lg:col-span-5 space-y-4">
-          {/* ✅ Store smoke test (temporal) */}
+          {/* Temporal: store test */}
           <StoreSmokeTest />
 
-          {/* ✅ Debug panel */}
+          {/* Debug */}
           <Card className="glass neon-border">
             <CardHeader>
               <CardTitle className="text-lg">Debug</CardTitle>
@@ -392,14 +387,12 @@ export default function ClipForge() {
               </div>
 
               {debugMsg && (
-                <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">
-                  {debugMsg}
-                </pre>
+                <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">{debugMsg}</pre>
               )}
 
               {lastJob && (
                 <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">
-{JSON.stringify(lastJob, null, 2).slice(0, 1500)}
+                  {JSON.stringify(lastJob, null, 2).slice(0, 1500)}
                 </pre>
               )}
             </CardContent>
@@ -497,8 +490,11 @@ export default function ClipForge() {
                 >
                   {isUploadingRef ? "Subiendo..." : referenceVideo ? "Cambiar referencia" : "Subir vídeo de referencia"}
                 </Button>
+
                 {referenceVideo?.url && (
-                  <p className="text-xs text-muted-foreground truncate">{referenceVideo.name || referenceVideo.url}</p>
+                  <p className="text-xs text-muted-foreground truncate">
+                    {referenceVideo.name || referenceVideo.url}
+                  </p>
                 )}
               </div>
 
@@ -536,13 +532,7 @@ export default function ClipForge() {
 
                 <div className="space-y-2">
                   <div className="text-sm text-muted-foreground">Duración (s)</div>
-                  <Input
-                    value={duration}
-                    type="number"
-                    min={5}
-                    max={300}
-                    onChange={(e) => setDuration(Number(e.target.value || 30))}
-                  />
+                  <Input value={duration} type="number" min={5} max={300} onChange={(e) => setDuration(Number(e.target.value || 30))} />
                 </div>
               </div>
             </CardContent>
