@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 
 import { ChatPanel } from "@/components/ChatPanel";
 import { EditPlanViewer } from "@/components/EditPlanViewer";
+import StoreSmokeTest from "@/components/StoreSmokeTest";
 
 type UploadedFile = { url: string; name?: string };
 type ClipItem = { url: string; name?: string; order: number; startTime?: number };
@@ -328,6 +329,9 @@ export default function ClipForge() {
 
         {/* Right: Inputs + Chat */}
         <div className="lg:col-span-5 space-y-4">
+          {/* ✅ Store smoke test (solo para comprobar Zustand) */}
+          <StoreSmokeTest />
+
           <Card className="glass neon-border">
             <CardHeader>
               <CardTitle className="text-lg">Inputs</CardTitle>
@@ -454,13 +458,7 @@ export default function ClipForge() {
 
                 <div className="space-y-2">
                   <div className="text-sm text-muted-foreground">Duración (s)</div>
-                  <Input
-                    value={duration}
-                    type="number"
-                    min={5}
-                    max={300}
-                    onChange={(e) => setDuration(Number(e.target.value || 30))}
-                  />
+                  <Input value={duration} type="number" min={5} max={300} onChange={(e) => setDuration(Number(e.target.value || 30))} />
                 </div>
               </div>
             </CardContent>
@@ -470,17 +468,12 @@ export default function ClipForge() {
           <ChatPanel
             context={chatContext}
             onPlan={(newPlan: any) => {
-              // si el ChatPanel ya llama a API y devuelve plan,
-              // aquí lo guardamos para el visor.
               if (newPlan?.success !== undefined) {
                 setPlan(newPlan);
               } else {
                 setPlan({ success: true, message: "Plan generado", plan: newPlan });
               }
             }}
-            // Fallback: si tu ChatPanel está “tonto” y solo gestiona UI,
-            // puedes usar esta función desde dentro del ChatPanel si lo conectas.
-            // (Si tu ChatPanel ya está bien, ignora esto.)
             onGeneratePlanFromChat={handleChatGeneratePlan as any}
           />
         </div>
