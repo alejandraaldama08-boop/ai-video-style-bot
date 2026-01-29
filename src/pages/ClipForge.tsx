@@ -7,7 +7,7 @@ import { ChatPanel } from "@/components/ChatPanel";
 import { EditPlanViewer } from "@/components/EditPlanViewer";
 import StoreSmokeTest from "@/components/StoreSmokeTest";
 
-type UploadedFile = { url: string; name?: string };
+type UploadedFile = { url: string; name?: string; mimetype?: string; size?: number };
 type ClipItem = { url: string; name?: string; order: number; startTime?: number };
 
 type PlanResponse =
@@ -22,10 +22,28 @@ type PlanResponse =
     }
   | null;
 
+type JobData = {
+  outputUrl?: string;
+  status?: string;
+  error?: string;
+  details?: string;
+  url?: string;
+};
+
 const API_URL =
   (import.meta as any).env?.VITE_API_URL ||
   (import.meta as any).env?.VITE_API_BASE_URL ||
   "http://localhost:3000";
+
+// ---------- helpers ----------
+async function readJsonSafe(res: Response) {
+  const text = await res.text().catch(() => "");
+  try {
+    return { json: JSON.parse(text), text };
+  } catch {
+    return { json: null, text };
+  }
+}
 
 async function uploadOne(file: File): Promise<UploadedFile> {
   const fd = new FormData();
@@ -36,14 +54,24 @@ async function uploadOne(file: File): Promise<UploadedFile> {
     body: fd,
   });
 
+  const { json, text } = await readJsonSafe(res);
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Upload failed (${res.status}): ${text}`);
+    const msg =
+      json?.error ||
+      json?.message ||
+      text ||
+      `Upload failed (${res.status})`;
+    throw new Error(msg);
   }
 
-  const data = await res.json().catch(() => ({} as any));
-  if (!data?.url) throw new Error("Upload response missing url");
-  return { url: data.url, name: data.name || file.name };
+  if (!json?.url) throw new Error("Upload response missing url");
+  return {
+    url: json.url,
+    name: json.name || file.name,
+    mimetype: json.mimetype,
+    size: json.size,
+  };
 }
 
 async function createRenderJob(payload: any): Promise<{ jobId: string }> {
@@ -53,57 +81,54 @@ async function createRenderJob(payload: any): Promise<{ jobId: string }> {
     body: JSON.stringify(payload),
   });
 
+  const { json, text } = await readJsonSafe(res);
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Render failed (${res.status}): ${text}`);
+    const msg =
+      json?.error || json?.message || text || `Render failed (${res.status})`;
+    throw new Error(msg);
   }
 
-  const data = await res.json().catch(() => ({} as any));
-  const jobId = data.jobId || data.id || data.job_id;
+  const jobId = json?.jobId || json?.id || json?.job_id;
   if (!jobId) throw new Error("Render response missing jobId");
   return { jobId };
 }
 
-async function pollJob(jobId: string): Promise<{ outputUrl?: string; status?: string; error?: string }> {
+async function pollJob(jobId: string): Promise<JobData> {
   const res = await fetch(`${API_URL}/job/${encodeURIComponent(jobId)}`);
+  const { json, text } = await readJsonSafe(res);
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Job poll failed (${res.status}): ${text}`);
+    const msg = json?.error || text || `Job poll failed (${res.status})`;
+    throw new Error(msg);
   }
-  const data = await res.json().catch(() => ({} as any));
-  return data;
+  return json || {};
 }
 
-async function generatePlan(messages: { role: "user" | "assistant"; content: string }[], context: any) {
+async function generatePlan(
+  messages: { role: "user" | "assistant"; content: string }[],
+  context: any
+) {
   const res = await fetch(`${API_URL}/plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages, context }),
   });
 
+  const { json, text } = await readJsonSafe(res);
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Plan failed (${res.status}): ${text}`);
+    const msg = json?.error || text || `Plan failed (${res.status})`;
+    throw new Error(msg);
   }
 
-  const data = await res.json().catch(() => ({} as any));
-
-  // Soporta varios formatos posibles
-  if (data?.plan) {
-    return {
-      success: true,
-      message: "Plan generado correctamente",
-      plan: data.plan,
-    };
+  if (json?.plan) {
+    return { success: true, message: "Plan generado correctamente", plan: json.plan };
   }
 
-  if (typeof data?.success === "boolean") return data as any;
+  if (typeof json?.success === "boolean") return json as any;
 
-  return {
-    success: true,
-    message: "Plan generado",
-    plan: data,
-  };
+  return { success: true, message: "Plan generado", plan: json };
 }
 
 export default function ClipForge() {
@@ -128,6 +153,11 @@ export default function ClipForge() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
 
+  // Debug UI
+  const [debugMsg, setDebugMsg] = useState<string>("");
+  const [lastJob, setLastJob] = useState<JobData | null>(null);
+  const [jobStatus, setJobStatus] = useState<string>("idle");
+
   // Refs for file inputs
   const clipInputRef = useRef<HTMLInputElement | null>(null);
   const musicInputRef = useRef<HTMLInputElement | null>(null);
@@ -146,6 +176,7 @@ export default function ClipForge() {
 
   async function handleUploadClips(files: FileList | null) {
     if (!files || files.length === 0) return;
+    setDebugMsg("");
     setIsUploadingClips(true);
     try {
       const uploaded: ClipItem[] = [];
@@ -154,19 +185,15 @@ export default function ClipForge() {
         const up = await uploadOne(f);
         uploaded.push({ url: up.url, name: up.name, order: i, startTime: 0 });
       }
-      // si ya había clips, los añadimos al final reordenando
       setClips((prev) => {
         const base = prev.slice();
         const startOrder = base.length;
-        const merged = base.concat(
-          uploaded.map((c, idx) => ({
-            ...c,
-            order: startOrder + idx,
-          }))
+        return base.concat(
+          uploaded.map((c, idx) => ({ ...c, order: startOrder + idx }))
         );
-        return merged;
       });
     } catch (e: any) {
+      setDebugMsg(`❌ Subida clips: ${e?.message || "Error subiendo clips"}`);
       alert(e?.message || "Error subiendo clips");
       console.error(e);
     } finally {
@@ -177,11 +204,22 @@ export default function ClipForge() {
 
   async function handleUploadMusic(file: File | null) {
     if (!file) return;
+    setDebugMsg("");
     setIsUploadingMusic(true);
     try {
+      // Debug: muestra qué estás intentando subir
+      setDebugMsg(
+        `🎵 Intentando subir música: ${file.name} (${file.type || "sin mimetype"}, ${(file.size / 1024 / 1024).toFixed(2)} MB)`
+      );
+
       const up = await uploadOne(file);
       setMusic(up);
+
+      setDebugMsg(
+        `✅ Música subida: ${up.name} | mimetype=${up.mimetype || "?"} | size=${up.size ? (up.size / 1024 / 1024).toFixed(2) + "MB" : "?"}`
+      );
     } catch (e: any) {
+      setDebugMsg(`❌ Subida música: ${e?.message || "Error subiendo música"}`);
       alert(e?.message || "Error subiendo música");
       console.error(e);
     } finally {
@@ -192,11 +230,13 @@ export default function ClipForge() {
 
   async function handleUploadReference(file: File | null) {
     if (!file) return;
+    setDebugMsg("");
     setIsUploadingRef(true);
     try {
       const up = await uploadOne(file);
       setReferenceVideo(up);
     } catch (e: any) {
+      setDebugMsg(`❌ Subida referencia: ${e?.message || "Error subiendo referencia"}`);
       alert(e?.message || "Error subiendo vídeo de referencia");
       console.error(e);
     } finally {
@@ -211,9 +251,12 @@ export default function ClipForge() {
       return;
     }
 
+    setDebugMsg("");
     setIsRendering(true);
     setOutputUrl(null);
     setJobId(null);
+    setLastJob(null);
+    setJobStatus("starting");
 
     try {
       const payload: any = {
@@ -237,29 +280,35 @@ export default function ClipForge() {
 
       const { jobId: newJobId } = await createRenderJob(payload);
       setJobId(newJobId);
+      setJobStatus("processing");
 
-      // Polling
       const start = Date.now();
       while (true) {
         const data = await pollJob(newJobId);
+        setLastJob(data);
 
         if (data?.status === "done" || data?.status === "completed" || data?.outputUrl) {
-          if (data?.outputUrl) setOutputUrl(data.outputUrl);
+          const out = data?.outputUrl || data?.url;
+          if (out) setOutputUrl(out);
+          setJobStatus("done");
           break;
         }
 
         if (data?.status === "error" || data?.error) {
-          throw new Error(data?.error || "Error en render");
+          setJobStatus("error");
+          const details = data?.details ? `\n\nDetalles:\n${String(data.details).slice(0, 1200)}` : "";
+          throw new Error((data?.error || "Error en render") + details);
         }
 
-        // corte de seguridad 6 min
         if (Date.now() - start > 6 * 60 * 1000) {
+          setJobStatus("timeout");
           throw new Error("Timeout esperando el render");
         }
 
         await new Promise((r) => setTimeout(r, 1500));
       }
     } catch (e: any) {
+      setDebugMsg(`❌ Render: ${e?.message || "Error renderizando"}`);
       alert(e?.message || "Error renderizando");
       console.error(e);
     } finally {
@@ -272,10 +321,7 @@ export default function ClipForge() {
       const res = await generatePlan(messages, chatContext);
       setPlan(res);
     } catch (e: any) {
-      setPlan({
-        success: false,
-        message: e?.message || "Error generando plan",
-      });
+      setPlan({ success: false, message: e?.message || "Error generando plan" });
     }
   }
 
@@ -297,8 +343,11 @@ export default function ClipForge() {
             </CardHeader>
             <CardContent className="space-y-3">
               {!outputUrl ? (
-                <div className="h-[320px] md:h-[420px] rounded-lg bg-secondary/40 flex items-center justify-center text-sm text-muted-foreground">
-                  {isRendering ? "Renderizando..." : "Aún no hay vídeo renderizado"}
+                <div className="h-[320px] md:h-[420px] rounded-lg bg-secondary/40 flex flex-col gap-2 items-center justify-center text-sm text-muted-foreground">
+                  <div>{isRendering ? "Renderizando..." : "Aún no hay vídeo renderizado"}</div>
+                  <div className="text-xs">
+                    Estado: <span className="font-mono">{jobStatus}</span>
+                  </div>
                 </div>
               ) : (
                 <video className="w-full rounded-lg bg-black" controls src={outputUrl} />
@@ -329,8 +378,32 @@ export default function ClipForge() {
 
         {/* Right: Inputs + Chat */}
         <div className="lg:col-span-5 space-y-4">
-          {/* ✅ Store smoke test (solo para comprobar Zustand) */}
+          {/* ✅ Store smoke test (temporal) */}
           <StoreSmokeTest />
+
+          {/* ✅ Debug panel */}
+          <Card className="glass neon-border">
+            <CardHeader>
+              <CardTitle className="text-lg">Debug</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <div className="text-xs text-muted-foreground">
+                API_URL: <span className="font-mono">{API_URL}</span>
+              </div>
+
+              {debugMsg && (
+                <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">
+                  {debugMsg}
+                </pre>
+              )}
+
+              {lastJob && (
+                <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">
+{JSON.stringify(lastJob, null, 2).slice(0, 1500)}
+                </pre>
+              )}
+            </CardContent>
+          </Card>
 
           <Card className="glass neon-border">
             <CardHeader>
@@ -398,7 +471,12 @@ export default function ClipForge() {
                 >
                   {isUploadingMusic ? "Subiendo..." : music ? "Cambiar música" : "Subir música"}
                 </Button>
-                {music?.url && <p className="text-xs text-muted-foreground truncate">{music.name || music.url}</p>}
+
+                {music?.url && (
+                  <p className="text-xs text-muted-foreground truncate">
+                    {music.name || music.url} {music.mimetype ? `(${music.mimetype})` : ""}
+                  </p>
+                )}
               </div>
 
               {/* Reference Video */}
@@ -458,7 +536,13 @@ export default function ClipForge() {
 
                 <div className="space-y-2">
                   <div className="text-sm text-muted-foreground">Duración (s)</div>
-                  <Input value={duration} type="number" min={5} max={300} onChange={(e) => setDuration(Number(e.target.value || 30))} />
+                  <Input
+                    value={duration}
+                    type="number"
+                    min={5}
+                    max={300}
+                    onChange={(e) => setDuration(Number(e.target.value || 30))}
+                  />
                 </div>
               </div>
             </CardContent>
@@ -468,11 +552,8 @@ export default function ClipForge() {
           <ChatPanel
             context={chatContext}
             onPlan={(newPlan: any) => {
-              if (newPlan?.success !== undefined) {
-                setPlan(newPlan);
-              } else {
-                setPlan({ success: true, message: "Plan generado", plan: newPlan });
-              }
+              if (newPlan?.success !== undefined) setPlan(newPlan);
+              else setPlan({ success: true, message: "Plan generado", plan: newPlan });
             }}
             onGeneratePlanFromChat={handleChatGeneratePlan as any}
           />
