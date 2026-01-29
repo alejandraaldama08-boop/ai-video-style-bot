@@ -10,6 +10,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
+// ✅ Render usa proxy; esto ayuda a que req.protocol sea https cuando toca
+app.set("trust proxy", 1);
+
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
@@ -24,6 +28,12 @@ fs.mkdirSync(RENDERS_DIR, { recursive: true });
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use("/renders", express.static(RENDERS_DIR));
 
+// ✅ helper para construir URLs correctas (https en Render)
+function baseUrl(req) {
+  const proto = req.header("x-forwarded-proto") || req.protocol || "http";
+  return `${proto}://${req.get("host")}`;
+}
+
 // =======================
 // Upload (clips + música)
 // =======================
@@ -34,14 +44,40 @@ const storage = multer.diskStorage({
     cb(null, `${Date.now()}-${safe}`);
   },
 });
-const upload = multer({ storage });
+
+// ✅ Permitir vídeo + audio (mp3, wav, m4a, etc.)
+const allowedMimes = new Set([
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+  "video/x-matroska",
+  "audio/mpeg", // mp3
+  "audio/mp3",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/mp4", // m4a
+  "audio/aac",
+  "audio/ogg",
+]);
+
+const upload = multer({
+  storage,
+  fileFilter: (_req, file, cb) => {
+    // si el browser no envía mimetype bien, permitimos por extensión como fallback
+    const ext = (path.extname(file.originalname) || "").toLowerCase();
+    const allowedExt = new Set([".mp4", ".mov", ".webm", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".ogg"]);
+
+    if (allowedMimes.has(file.mimetype) || allowedExt.has(ext)) return cb(null, true);
+    return cb(new Error(`Tipo de archivo no permitido: ${file.mimetype} (${file.originalname})`), false);
+  },
+});
 
 app.post("/upload", upload.single("file"), (req, res) => {
   const file = req.file;
-  if (!file) return res.status(400).json({ ok: false });
+  if (!file) return res.status(400).json({ ok: false, error: "No file uploaded" });
 
-  const url = `${req.protocol}://${req.get("host")}/uploads/${encodeURIComponent(file.filename)}`;
-  res.json({ ok: true, url });
+  const url = `${baseUrl(req)}/uploads/${encodeURIComponent(file.filename)}`;
+  res.json({ ok: true, url, name: file.originalname });
 });
 
 // =======================
@@ -52,14 +88,62 @@ app.get("/health", (_req, res) => {
 });
 
 // =======================
+// PLAN (para el chat) ✅
+// =======================
+app.post("/plan", async (req, res) => {
+  // De momento: plan “útil” mock para no romper el chat.
+  // Luego conectamos aquí IA real (OpenAI) y usamos clips/music/ref/youtube.
+  const { context } = req.body || {};
+  const format = context?.format || "reels";
+  const duration = context?.duration || 30;
+
+  res.json({
+    plan: {
+      style: { name: "dynamic", transitions: true, zoom: false, beatSync: false },
+      format,
+      duration,
+      overlays: [],
+      suggestions: [
+        "Si tienes música, activa beatSync para cortes al ritmo",
+        "Usa un hook potente en los primeros 2 segundos",
+      ],
+      timeline: [],
+    },
+  });
+});
+
+// =======================
+// Jobs (para polling) ✅
+// =======================
+// Guardamos jobs en memoria (suficiente por ahora)
+const JOBS = new Map(); // jobId -> { status, outputUrl?, error?, createdAt }
+
+function makeJobId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+app.get("/job/:id", (req, res) => {
+  const job = JOBS.get(req.params.id);
+  if (!job) return res.status(404).json({ status: "not_found", error: "Job not found" });
+  res.json(job);
+});
+
+// =======================
 // Render MP4 REAL
 // =======================
 app.post("/render", async (req, res) => {
+  let jobId = null;
+
   try {
     const { clips = [], music, format = "reels", duration } = req.body || {};
     if (!Array.isArray(clips) || clips.length === 0) {
       return res.status(400).json({ ok: false, error: "No clips provided" });
     }
+
+    // ✅ Crea job y responde con jobId (tu frontend hace polling)
+    jobId = makeJobId();
+    JOBS.set(jobId, { status: "processing", createdAt: Date.now() });
+    res.json({ ok: true, jobId });
 
     const isVertical = format !== "youtube";
     const W = isVertical ? 1080 : 1920;
@@ -71,9 +155,9 @@ app.post("/render", async (req, res) => {
       return path.join(UPLOADS_DIR, name);
     };
 
-    const inputs = clips.map(c => toLocal(c.url));
-    inputs.forEach(p => {
-      if (!fs.existsSync(p)) throw new Error("Missing clip on server");
+    const inputs = clips.map((c) => toLocal(c.url));
+    inputs.forEach((p) => {
+      if (!fs.existsSync(p)) throw new Error("Missing clip on server: " + p);
     });
 
     const outName = `${Date.now()}-final.mp4`;
@@ -86,13 +170,10 @@ app.post("/render", async (req, res) => {
         `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}]`
       );
     }
-    filter.push(
-      inputs.map((_, i) => `[v${i}]`).join("") +
-      `concat=n=${inputs.length}:v=1:a=0[vout]`
-    );
+    filter.push(inputs.map((_, i) => `[v${i}]`).join("") + `concat=n=${inputs.length}:v=1:a=0[vout]`);
 
     const args = ["-y"];
-    inputs.forEach(p => args.push("-i", p));
+    inputs.forEach((p) => args.push("-i", p));
 
     let hasMusic = false;
     if (music?.url) {
@@ -114,30 +195,29 @@ app.post("/render", async (req, res) => {
 
     if (duration) args.push("-t", String(duration));
 
-    args.push(
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "22",
-      "-pix_fmt", "yuv420p",
-      "-movflags", "+faststart",
-      outPath
-    );
+    args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart", outPath);
 
     execFile("ffmpeg", args, (err, _out, stderr) => {
       if (err) {
-        return res.status(500).json({
-          ok: false,
+        JOBS.set(jobId, {
+          status: "error",
           error: "FFmpeg error",
-          details: stderr?.slice?.(0, 3000)
+          details: stderr?.slice?.(0, 3000),
+          createdAt: Date.now(),
         });
+        return;
       }
 
-      const url = `${req.protocol}://${req.get("host")}/renders/${encodeURIComponent(outName)}`;
-      res.json({ ok: true, url, videoUrl: url });
-    });
+      const url = `${baseUrl(req)}/renders/${encodeURIComponent(outName)}`;
 
+      // ✅ Guardamos estado del job para polling
+      JOBS.set(jobId, { status: "done", outputUrl: url, url, createdAt: Date.now() });
+    });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    if (jobId) JOBS.set(jobId, { status: "error", error: String(e), createdAt: Date.now() });
+    // si ya respondimos con jobId, no devolvemos otro res aquí
+    // si no respondimos, entonces sí:
+    // (pero en este flujo ya respondimos antes)
   }
 });
 
