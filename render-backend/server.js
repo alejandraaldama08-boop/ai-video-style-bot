@@ -5,13 +5,14 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { fileURLToPath } from "url";
+import { pipeline } from "stream/promises";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// ✅ MUY IMPORTANTE en Render/Proxy (para que req.protocol / x-forwarded-proto funcionen)
+// ✅ IMPORTANTE en Render / proxies
 app.set("trust proxy", 1);
 
 app.use(cors());
@@ -25,14 +26,57 @@ const RENDERS_DIR = path.join(__dirname, "renders");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(RENDERS_DIR, { recursive: true });
 
-// Static
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use("/renders", express.static(RENDERS_DIR));
 
-// ✅ Helper para URLs seguras (evita mixed content)
+// =======================
+// Helpers
+// =======================
 function getBaseUrl(req) {
-  const proto = req.get("x-forwarded-proto") || "https";
+  // Render envía el proto real aquí
+  const proto = req.get("x-forwarded-proto") || req.protocol || "https";
   return `${proto}://${req.get("host")}`;
+}
+
+function safeFilename(originalname) {
+  // Más robusto que solo espacios (evita paréntesis/raros)
+  return originalname
+    .normalize("NFKD")
+    .replace(/[^\w.\-]+/g, "_")
+    .replace(/_+/g, "_");
+}
+
+function filenameFromUrl(url) {
+  const u = new URL(url);
+  const last = u.pathname.split("/").pop() || "";
+  return decodeURIComponent(last);
+}
+
+async function downloadToFile(url, destPath) {
+  // Node 18+ tiene fetch global
+  const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Download failed ${res.status}: ${text.slice(0, 300)}`);
+  }
+  await pipeline(res.body, fs.createWriteStream(destPath));
+  return destPath;
+}
+
+async function ensureLocalFile(url) {
+  const name = filenameFromUrl(url);
+  const localPath = path.join(UPLOADS_DIR, name);
+
+  if (fs.existsSync(localPath)) return localPath;
+
+  // Si no existe local, lo descargamos desde la URL (soluciona multi-instancia/restart)
+  console.log(`[ENSURE] missing locally, downloading: ${url} -> ${localPath}`);
+  await downloadToFile(url, localPath);
+
+  if (!fs.existsSync(localPath)) {
+    throw new Error(`Still missing after download: ${localPath}`);
+  }
+  return localPath;
 }
 
 // =======================
@@ -41,17 +85,22 @@ function getBaseUrl(req) {
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, UPLOADS_DIR),
   filename: (_, file, cb) => {
-    const safe = file.originalname.replace(/\s+/g, "_");
+    const safe = safeFilename(file.originalname);
     cb(null, `${Date.now()}-${safe}`);
   },
 });
-const upload = multer({ storage });
+
+const upload = multer({
+  storage,
+  // opcional: sube el límite si quieres
+  limits: { fileSize: 1024 * 1024 * 500 }, // 500MB
+});
 
 app.post("/upload", upload.single("file"), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ ok: false, error: "No file" });
 
-  console.log(`[UPLOAD] name=${file.originalname}, mime=${file.mimetype}, size=${file.size}`);
+  console.log(`[UPLOAD] name=${file.originalname}, saved=${file.filename}, mime=${file.mimetype}, size=${file.size}`);
 
   const base = getBaseUrl(req);
   const url = `${base}/uploads/${encodeURIComponent(file.filename)}`;
@@ -74,12 +123,11 @@ app.get("/health", (_req, res) => {
 });
 
 // =======================
-// Render MP4 REAL (sync / sin jobs)
+// Render MP4 REAL
 // =======================
 app.post("/render", async (req, res) => {
   try {
     const { clips = [], music, format = "reels", duration } = req.body || {};
-
     if (!Array.isArray(clips) || clips.length === 0) {
       return res.status(400).json({ ok: false, error: "No clips provided" });
     }
@@ -88,48 +136,39 @@ app.post("/render", async (req, res) => {
     const W = isVertical ? 1080 : 1920;
     const H = isVertical ? 1920 : 1080;
 
-    // Resolver rutas locales desde URLs /uploads/...
-    const toLocal = (url) => {
-      const name = decodeURIComponent(new URL(url).pathname.split("/").pop());
-      return path.join(UPLOADS_DIR, name);
-    };
+    // ✅ Asegura que todos los clips existen localmente (si no, los descarga)
+    const inputs = [];
+    for (const c of clips) {
+      if (!c?.url) throw new Error("Clip missing url");
+      const local = await ensureLocalFile(c.url);
+      inputs.push(local);
+    }
 
-    const inputs = clips.map((c) => toLocal(c.url));
-
-    inputs.forEach((p) => {
-      if (!fs.existsSync(p)) {
-        throw new Error(`Missing clip on server: ${p}`);
-      }
-    });
-
-    // salida
     const outName = `${Date.now()}-render.mp4`;
     const outPath = path.join(RENDERS_DIR, outName);
 
-    // Construir filtros de concat de video
+    // Construir filtros (concat de varios clips)
     const filter = [];
     for (let i = 0; i < inputs.length; i++) {
       filter.push(
-        `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}]`
+        `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
+          `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}]`
       );
     }
     filter.push(inputs.map((_, i) => `[v${i}]`).join("") + `concat=n=${inputs.length}:v=1:a=0[vout]`);
 
     const args = ["-y"];
-
-    // inputs video
     inputs.forEach((p) => args.push("-i", p));
 
-    // music opcional
+    // Música (opcional) => también aseguramos local
     let hasMusic = false;
-    let musicLocal = null;
     if (music?.url) {
-      musicLocal = toLocal(music.url);
-      if (fs.existsSync(musicLocal)) {
-        args.push("-i", musicLocal);
+      try {
+        const m = await ensureLocalFile(music.url);
+        args.push("-i", m);
         hasMusic = true;
-      } else {
-        console.log(`[RENDER] music missing on server: ${musicLocal}`);
+      } catch (e) {
+        console.log(`[MUSIC] could not use music: ${String(e)}`);
       }
     }
 
@@ -137,7 +176,6 @@ app.post("/render", async (req, res) => {
     args.push("-map", "[vout]");
 
     if (hasMusic) {
-      // La música es el último input: index = inputs.length
       args.push("-map", `${inputs.length}:a`, "-shortest", "-c:a", "aac");
     } else {
       args.push("-an");
@@ -159,12 +197,9 @@ app.post("/render", async (req, res) => {
       outPath
     );
 
-    console.log(`[RENDER] inputs=${inputs.length}, hasMusic=${hasMusic}, out=${outName}`);
-    if (hasMusic) console.log(`[RENDER] music=${musicLocal}`);
-
     execFile("ffmpeg", args, (err, _out, stderr) => {
       if (err) {
-        console.error("[FFMPEG ERROR]", stderr?.slice?.(0, 3000));
+        console.log("[FFMPEG ERROR]", stderr?.slice?.(0, 3000));
         return res.status(500).json({
           ok: false,
           error: "FFmpeg error",
@@ -174,14 +209,13 @@ app.post("/render", async (req, res) => {
 
       const base = getBaseUrl(req);
       const url = `${base}/renders/${encodeURIComponent(outName)}`;
-      console.log(`[RENDER DONE] outName=${outName}, url=${url}`);
 
-      // ✅ el frontend tuyo entiende url/videoUrl/outputUrl según casos:
-      res.json({ ok: true, url, videoUrl: url, outputUrl: url });
+      console.log(`[RENDER] out=${outPath} url=${url}`);
+      res.json({ ok: true, url, videoUrl: url });
     });
   } catch (e) {
-    console.error("[RENDER ERROR]", e);
-    res.status(500).json({ ok: false, error: String(e) });
+    console.log("[RENDER ERROR]", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
