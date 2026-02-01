@@ -5,191 +5,158 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { fileURLToPath } from "url";
-import http from "http";
-import https from "https";
+import { createClient } from "@supabase/supabase-js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// IMPORTANT: Render/Proxies (para x-forwarded-proto)
+// IMPORTANT: render / proxies
 app.set("trust proxy", 1);
 
 app.use(cors());
-app.use(express.json({ limit: "100mb" }));
+app.use(express.json({ limit: "200mb" }));
 
 // =======================
-// Carpetas
+// Env (Render)
 // =======================
-const UPLOADS_DIR = path.join(__dirname, "uploads");
-const RENDERS_DIR = path.join(__dirname, "renders");
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-fs.mkdirSync(RENDERS_DIR, { recursive: true });
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Static
-app.use("/uploads", express.static(UPLOADS_DIR));
-app.use("/renders", express.static(RENDERS_DIR));
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn("⚠️ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in env");
+}
+
+const supabase = createClient(SUPABASE_URL || "", SUPABASE_SERVICE_ROLE_KEY || "");
+
+// Buckets
+const BUCKET_UPLOADS = "uploads";
+const BUCKET_RENDERS = "renders";
 
 // =======================
-// Helpers
+// Local temp folders (Render ephemeral ok)
 // =======================
+const TMP_DIR = path.join(__dirname, "tmp");
+const TMP_UPLOADS = path.join(TMP_DIR, "uploads");
+const TMP_RENDERS = path.join(TMP_DIR, "renders");
+
+fs.mkdirSync(TMP_UPLOADS, { recursive: true });
+fs.mkdirSync(TMP_RENDERS, { recursive: true });
+
+// Optional local debug access (not required)
+app.use("/tmp/uploads", express.static(TMP_UPLOADS));
+app.use("/tmp/renders", express.static(TMP_RENDERS));
+
 function getBaseUrl(req) {
   const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
   return `${proto}://${req.get("host")}`;
 }
 
-function safeName(original) {
-  // Evita nombres raros que luego den problemas en URL o filesystem
-  return String(original || "file")
-    .trim()
-    .replace(/\s+/g, "_")
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
-    .replace(/_+/g, "_");
+function safeName(name) {
+  return name.replace(/\s+/g, "_").replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function isOurUploadsUrl(req, urlStr) {
+async function readJsonSafe(res) {
+  const text = await res.text().catch(() => "");
   try {
-    const u = new URL(urlStr);
-    const host = req.get("host");
-    return u.host === host && u.pathname.startsWith("/uploads/");
+    return { json: JSON.parse(text), text };
   } catch {
-    return false;
+    return { json: null, text };
   }
 }
 
-function localPathFromUploadsUrl(urlStr) {
-  const u = new URL(urlStr);
-  const filename = decodeURIComponent(u.pathname.split("/").pop() || "");
-  return path.join(UPLOADS_DIR, filename);
+// =======================
+// Multer (memory) -> Supabase
+// =======================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1024 * 1024 * 300 }, // 300MB
+});
+
+// Build public URL for a stored object
+function publicUrl(bucket, key) {
+  const { data } = supabase.storage.from(bucket).getPublicUrl(key);
+  return data?.publicUrl;
 }
 
-// Descarga URL (http/https) -> destPath (/tmp/xxx)
-function downloadToFile(urlStr, destPath, maxRedirects = 5) {
-  return new Promise((resolve, reject) => {
-    let urlObj;
-    try {
-      urlObj = new URL(urlStr);
-    } catch (e) {
-      reject(new Error(`Invalid URL: ${urlStr}`));
-      return;
-    }
+// =======================
+// Upload endpoint (clips + music)
+// =======================
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ ok: false, error: "No file" });
 
-    const getter = urlObj.protocol === "http:" ? http.get : https.get;
-
-    const req = getter(
-      urlStr,
-      {
-        headers: {
-          "User-Agent": "render-backend/1.0",
-        },
-      },
-      (res) => {
-        // Redirects
-        if (
-          res.statusCode &&
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          if (maxRedirects <= 0) {
-            reject(new Error(`Too many redirects downloading: ${urlStr}`));
-            return;
-          }
-          const nextUrl = new URL(res.headers.location, urlStr).toString();
-          res.resume();
-          downloadToFile(nextUrl, destPath, maxRedirects - 1).then(resolve).catch(reject);
-          return;
-        }
-
-        if (res.statusCode !== 200) {
-          const chunks = [];
-          res.on("data", (d) => chunks.push(d));
-          res.on("end", () => {
-            const body = Buffer.concat(chunks).toString("utf8").slice(0, 300);
-            reject(new Error(`Download failed ${res.statusCode}: ${body}`));
-          });
-          return;
-        }
-
-        const file = fs.createWriteStream(destPath);
-        res.pipe(file);
-
-        file.on("finish", () => file.close(() => resolve(destPath)));
-        file.on("error", (err) => reject(err));
-      }
+    // Basic logging
+    console.log(
+      `[UPLOAD] name=${file.originalname} mime=${file.mimetype} size=${file.size}`
     );
 
-    req.on("error", (err) => reject(err));
-  });
-}
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "Supabase env vars missing on server (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)",
+      });
+    }
 
-// Obtiene una ruta local usable por ffmpeg:
-// 1) si es URL de /uploads y existe local -> usa local
-// 2) si no existe -> descarga a /tmp
-async function resolveToFfmpegLocalPath(req, urlStr, label = "input") {
-  // Caso: URL de nuestro /uploads
-  if (isOurUploadsUrl(req, urlStr)) {
-    const local = localPathFromUploadsUrl(urlStr);
-    if (fs.existsSync(local)) return local;
+    const key = `${Date.now()}-${safeName(file.originalname)}`;
 
-    // Si no existe (el típico error que tienes), intentamos descargar desde la URL igualmente
-    const tmp = path.join("/tmp", `${Date.now()}-${label}-${path.basename(local)}`);
-    await downloadToFile(urlStr, tmp);
-    return tmp;
+    const { error } = await supabase.storage
+      .from(BUCKET_UPLOADS)
+      .upload(key, file.buffer, {
+        contentType: file.mimetype || "application/octet-stream",
+        upsert: false,
+      });
+
+    if (error) {
+      console.error("[UPLOAD] supabase error:", error);
+      return res.status(500).json({ ok: false, error: `Supabase upload error: ${error.message}` });
+    }
+
+    const url = publicUrl(BUCKET_UPLOADS, key);
+
+    if (!url) {
+      return res.status(500).json({ ok: false, error: "Could not get public URL from Supabase" });
+    }
+
+    res.json({
+      ok: true,
+      url,
+      key,
+      mimetype: file.mimetype,
+      size: file.size,
+      name: file.originalname,
+      // base: getBaseUrl(req), // if you want to debug
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e) });
   }
-
-  // Caso general: URL remota (S3, etc)
-  const tmp = path.join("/tmp", `${Date.now()}-${label}-${safeName(path.basename(new URL(urlStr).pathname))}`);
-  await downloadToFile(urlStr, tmp);
-  return tmp;
-}
-
-// =======================
-// Upload (clips + música)
-// =======================
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, UPLOADS_DIR),
-  filename: (_, file, cb) => {
-    const safe = safeName(file.originalname);
-    cb(null, `${Date.now()}-${safe}`);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: 250 * 1024 * 1024, // 250MB (ajusta si quieres)
-  },
-});
-
-app.post("/upload", upload.single("file"), (req, res) => {
-  const file = req.file;
-  if (!file) return res.status(400).json({ ok: false, error: "No file" });
-
-  console.log(`[UPLOAD] name=${file.originalname} saved=${file.filename} mime=${file.mimetype} size=${file.size}`);
-
-  const base = getBaseUrl(req);
-  const url = `${base}/uploads/${encodeURIComponent(file.filename)}`;
-
-  res.json({
-    ok: true,
-    url,
-    name: file.originalname,
-    mimetype: file.mimetype,
-    size: file.size,
-  });
 });
 
 // =======================
 // Health
 // =======================
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "render-backend", ffmpeg: true });
+  res.json({ ok: true, service: "render-backend", ffmpeg: true, storage: "supabase" });
 });
 
 // =======================
-// Render MP4 (robusto con /tmp)
+// Helper: download remote URL -> local file
+// =======================
+async function downloadToFile(url, outPath) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    const { text } = await readJsonSafe(r);
+    throw new Error(`Download failed ${r.status}: ${text?.slice?.(0, 400) || ""}`);
+  }
+  const arr = new Uint8Array(await r.arrayBuffer());
+  fs.writeFileSync(outPath, arr);
+}
+
+// =======================
+// Render MP4 (sync style) + upload result to Supabase renders
 // =======================
 app.post("/render", async (req, res) => {
   try {
@@ -199,61 +166,66 @@ app.post("/render", async (req, res) => {
       return res.status(400).json({ ok: false, error: "No clips provided" });
     }
 
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "Supabase env vars missing on server (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)",
+      });
+    }
+
     const isVertical = format !== "youtube";
     const W = isVertical ? 1080 : 1920;
     const H = isVertical ? 1920 : 1080;
 
-    // Orden
-    const sortedClips = clips
-      .slice()
-      .sort((a, b) => (a?.order ?? 0) - (b?.order ?? 0));
+    // 1) Download all clips to temp
+    const sorted = clips.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
-    // Resolver a paths locales (si falta local, descarga a /tmp)
-    const localInputs = [];
-    for (let i = 0; i < sortedClips.length; i++) {
-      const c = sortedClips[i];
+    const inputPaths = [];
+    for (let i = 0; i < sorted.length; i++) {
+      const c = sorted[i];
       if (!c?.url) throw new Error("Clip missing url");
-      const p = await resolveToFfmpegLocalPath(req, c.url, `clip${i}`);
-      localInputs.push(p);
+      const local = path.join(TMP_UPLOADS, `${Date.now()}-clip-${i}.mp4`);
+      await downloadToFile(c.url, local);
+      inputPaths.push(local);
     }
 
-    // Música (opcional)
+    // 2) Optional music download
     let musicPath = null;
     if (music?.url) {
-      musicPath = await resolveToFfmpegLocalPath(req, music.url, "music");
+      const local = path.join(TMP_UPLOADS, `${Date.now()}-music`);
+      // keep extension if possible
+      const ext = (music.url.split("?")[0].split(".").pop() || "mp3").slice(0, 6);
+      musicPath = `${local}.${ext}`;
+      await downloadToFile(music.url, musicPath);
     }
 
+    // 3) ffmpeg output
     const outName = `${Date.now()}-render.mp4`;
-    const outPath = path.join(RENDERS_DIR, outName);
+    const outPath = path.join(TMP_RENDERS, outName);
 
-    // Filtros de vídeo
+    // Filter graph: scale + pad each clip then concat
     const filter = [];
-    for (let i = 0; i < localInputs.length; i++) {
+    for (let i = 0; i < inputPaths.length; i++) {
       filter.push(
         `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,` +
           `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}]`
       );
     }
-
     filter.push(
-      localInputs.map((_, i) => `[v${i}]`).join("") +
-        `concat=n=${localInputs.length}:v=1:a=0[vout]`
+      inputPaths.map((_, i) => `[v${i}]`).join("") +
+        `concat=n=${inputPaths.length}:v=1:a=0[vout]`
     );
 
     const args = ["-y"];
-
-    // inputs video
-    localInputs.forEach((p) => args.push("-i", p));
-
-    // input audio
-    const hasMusic = Boolean(musicPath);
-    if (hasMusic) args.push("-i", musicPath);
+    inputPaths.forEach((p) => args.push("-i", p));
+    if (musicPath) args.push("-i", musicPath);
 
     args.push("-filter_complex", filter.join(";"));
     args.push("-map", "[vout]");
 
-    if (hasMusic) {
-      args.push("-map", `${localInputs.length}:a`, "-shortest", "-c:a", "aac");
+    if (musicPath) {
+      // music is last input
+      args.push("-map", `${inputPaths.length}:a`, "-shortest", "-c:a", "aac");
     } else {
       args.push("-an");
     }
@@ -274,27 +246,49 @@ app.post("/render", async (req, res) => {
       outPath
     );
 
-    console.log("[RENDER] ffmpeg args:", args.join(" "));
-
-    execFile("ffmpeg", args, (err, _stdout, stderr) => {
-      if (err) {
-        console.error("[RENDER] ffmpeg error:", stderr?.slice?.(0, 2000));
-        return res.status(500).json({
-          ok: false,
-          error: "FFmpeg error",
-          details: stderr?.slice?.(0, 3000),
-        });
-      }
-
-      const base = getBaseUrl(req);
-      const url = `${base}/renders/${encodeURIComponent(outName)}`;
-
-      console.log(`[RENDER] OK -> ${url}`);
-      res.json({ ok: true, url, videoUrl: url });
+    // 4) Run ffmpeg
+    await new Promise((resolve, reject) => {
+      execFile("ffmpeg", args, (err, _out, stderr) => {
+        if (err) {
+          console.error("[FFMPEG] error:", stderr?.slice?.(0, 2000));
+          return reject(new Error(stderr?.slice?.(0, 3000) || "FFmpeg error"));
+        }
+        resolve(true);
+      });
     });
+
+    // 5) Upload output to Supabase renders
+    const buffer = fs.readFileSync(outPath);
+    const key = outName;
+
+    const { error } = await supabase.storage.from(BUCKET_RENDERS).upload(key, buffer, {
+      contentType: "video/mp4",
+      upsert: true,
+    });
+
+    if (error) {
+      console.error("[RENDER UPLOAD] supabase error:", error);
+      return res.status(500).json({ ok: false, error: `Supabase render upload error: ${error.message}` });
+    }
+
+    const url = publicUrl(BUCKET_RENDERS, key);
+    if (!url) {
+      return res.status(500).json({ ok: false, error: "Could not get public URL for render" });
+    }
+
+    console.log(`[RENDER] ok url=${url}`);
+
+    // 6) Cleanup temp files (best-effort)
+    try {
+      inputPaths.forEach((p) => fs.existsSync(p) && fs.unlinkSync(p));
+      if (musicPath && fs.existsSync(musicPath)) fs.unlinkSync(musicPath);
+      if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+    } catch {}
+
+    res.json({ ok: true, url, videoUrl: url });
   } catch (e) {
-    console.error("[RENDER] ERROR:", e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
