@@ -5,16 +5,23 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// ✅ Render usa proxy; esto ayuda a que req.protocol sea https cuando toca
-app.set("trust proxy", 1);
+// CORS abierto (ajustaremos luego si quieres)
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors());
 
-app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
 // =======================
@@ -28,12 +35,6 @@ fs.mkdirSync(RENDERS_DIR, { recursive: true });
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use("/renders", express.static(RENDERS_DIR));
 
-// ✅ helper para construir URLs correctas (https en Render)
-function baseUrl(req) {
-  const proto = req.header("x-forwarded-proto") || req.protocol || "http";
-  return `${proto}://${req.get("host")}`;
-}
-
 // =======================
 // Upload (clips + música)
 // =======================
@@ -45,39 +46,25 @@ const storage = multer.diskStorage({
   },
 });
 
-// ✅ Permitir vídeo + audio (mp3, wav, m4a, etc.)
-const allowedMimes = new Set([
-  "video/mp4",
-  "video/quicktime",
-  "video/webm",
-  "video/x-matroska",
-  "audio/mpeg", // mp3
-  "audio/mp3",
-  "audio/wav",
-  "audio/x-wav",
-  "audio/mp4", // m4a
-  "audio/aac",
-  "audio/ogg",
-]);
-
+// ✅ sin fileFilter restrictivo: acepta mp3/m4a/wav/video etc
 const upload = multer({
   storage,
-  fileFilter: (_req, file, cb) => {
-    // si el browser no envía mimetype bien, permitimos por extensión como fallback
-    const ext = (path.extname(file.originalname) || "").toLowerCase();
-    const allowedExt = new Set([".mp4", ".mov", ".webm", ".mkv", ".mp3", ".wav", ".m4a", ".aac", ".ogg"]);
-
-    if (allowedMimes.has(file.mimetype) || allowedExt.has(ext)) return cb(null, true);
-    return cb(new Error(`Tipo de archivo no permitido: ${file.mimetype} (${file.originalname})`), false);
-  },
+  limits: { fileSize: 300 * 1024 * 1024 }, // 300MB, ajusta si quieres
 });
 
 app.post("/upload", upload.single("file"), (req, res) => {
   const file = req.file;
-  if (!file) return res.status(400).json({ ok: false, error: "No file uploaded" });
+  if (!file) return res.status(400).json({ ok: false, error: "No file" });
 
-  const url = `${baseUrl(req)}/uploads/${encodeURIComponent(file.filename)}`;
-  res.json({ ok: true, url, name: file.originalname });
+  const url = `${req.protocol}://${req.get("host")}/uploads/${encodeURIComponent(file.filename)}`;
+
+  res.json({
+    ok: true,
+    url,
+    name: file.originalname,
+    mimetype: file.mimetype,
+    size: file.size,
+  });
 });
 
 // =======================
@@ -88,51 +75,40 @@ app.get("/health", (_req, res) => {
 });
 
 // =======================
-// PLAN (para el chat) ✅
+// Plan (simple) — para que no falle el chat si llama /plan
 // =======================
-app.post("/plan", async (req, res) => {
-  // De momento: plan “útil” mock para no romper el chat.
-  // Luego conectamos aquí IA real (OpenAI) y usamos clips/music/ref/youtube.
+app.post("/plan", (req, res) => {
   const { context } = req.body || {};
-  const format = context?.format || "reels";
-  const duration = context?.duration || 30;
-
+  // Plan muy básico (luego lo haremos “bueno”)
   res.json({
+    success: true,
     plan: {
       style: { name: "dynamic", transitions: true, zoom: false, beatSync: false },
-      format,
-      duration,
+      duration: context?.duration ?? 30,
+      format: context?.format ?? "reels",
       overlays: [],
-      suggestions: [
-        "Si tienes música, activa beatSync para cortes al ritmo",
-        "Usa un hook potente en los primeros 2 segundos",
-      ],
-      timeline: [],
+      suggestions: ["Sube música para mejor ritmo"],
     },
   });
 });
 
 // =======================
-// Jobs (para polling) ✅
+// JOBS en memoria
 // =======================
-// Guardamos jobs en memoria (suficiente por ahora)
-const JOBS = new Map(); // jobId -> { status, outputUrl?, error?, createdAt }
+const jobs = new Map(); // jobId -> { status, outputUrl, error, details }
 
-function makeJobId() {
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
+// GET /job/:id
 app.get("/job/:id", (req, res) => {
-  const job = JOBS.get(req.params.id);
-  if (!job) return res.status(404).json({ status: "not_found", error: "Job not found" });
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ status: "error", error: "Job not found" });
   res.json(job);
 });
 
 // =======================
-// Render MP4 REAL
+// Render MP4 (JOB async)
 // =======================
 app.post("/render", async (req, res) => {
-  let jobId = null;
+  const jobId = crypto.randomBytes(8).toString("hex");
 
   try {
     const { clips = [], music, format = "reels", duration } = req.body || {};
@@ -140,30 +116,32 @@ app.post("/render", async (req, res) => {
       return res.status(400).json({ ok: false, error: "No clips provided" });
     }
 
-    // ✅ Crea job y responde con jobId (tu frontend hace polling)
-    jobId = makeJobId();
-    JOBS.set(jobId, { status: "processing", createdAt: Date.now() });
-    res.json({ ok: true, jobId });
+    // Creamos el job YA y devolvemos jobId
+    jobs.set(jobId, { status: "processing" });
+    res.json({ jobId });
 
     const isVertical = format !== "youtube";
     const W = isVertical ? 1080 : 1920;
     const H = isVertical ? 1920 : 1080;
 
-    // Resolver rutas locales
     const toLocal = (url) => {
       const name = decodeURIComponent(new URL(url).pathname.split("/").pop());
       return path.join(UPLOADS_DIR, name);
     };
 
-    const inputs = clips.map((c) => toLocal(c.url));
+    const inputs = clips
+      .slice()
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      .map((c) => toLocal(c.url));
+
     inputs.forEach((p) => {
-      if (!fs.existsSync(p)) throw new Error("Missing clip on server: " + p);
+      if (!fs.existsSync(p)) throw new Error(`Missing clip on server: ${p}`);
     });
 
-    const outName = `${Date.now()}-final.mp4`;
+    const outName = `${Date.now()}-render.mp4`;
     const outPath = path.join(RENDERS_DIR, outName);
 
-    // Construir filtros
+    // filtros: scale+pad cada clip + concat
     const filter = [];
     for (let i = 0; i < inputs.length; i++) {
       filter.push(
@@ -188,6 +166,7 @@ app.post("/render", async (req, res) => {
     args.push("-map", "[vout]");
 
     if (hasMusic) {
+      // último input es el audio
       args.push("-map", `${inputs.length}:a`, "-shortest", "-c:a", "aac");
     } else {
       args.push("-an");
@@ -195,33 +174,38 @@ app.post("/render", async (req, res) => {
 
     if (duration) args.push("-t", String(duration));
 
-    args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart", outPath);
+    args.push(
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "22",
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+      outPath
+    );
 
     execFile("ffmpeg", args, (err, _out, stderr) => {
       if (err) {
-        JOBS.set(jobId, {
+        jobs.set(jobId, {
           status: "error",
           error: "FFmpeg error",
-          details: stderr?.slice?.(0, 3000),
-          createdAt: Date.now(),
+          details: String(stderr || "").slice(0, 3000),
         });
         return;
       }
 
-      const url = `${baseUrl(req)}/renders/${encodeURIComponent(outName)}`;
-
-      // ✅ Guardamos estado del job para polling
-      JOBS.set(jobId, { status: "done", outputUrl: url, url, createdAt: Date.now() });
+      const outputUrl = `${req.protocol}://${req.get("host")}/renders/${encodeURIComponent(outName)}`;
+      jobs.set(jobId, { status: "done", outputUrl });
     });
   } catch (e) {
-    if (jobId) JOBS.set(jobId, { status: "error", error: String(e), createdAt: Date.now() });
-    // si ya respondimos con jobId, no devolvemos otro res aquí
-    // si no respondimos, entonces sí:
-    // (pero en este flujo ya respondimos antes)
+    jobs.set(jobId, { status: "error", error: String(e) });
   }
 });
 
-// =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("🎬 Render backend listening on", PORT);
