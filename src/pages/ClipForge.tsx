@@ -22,16 +22,7 @@ type PlanResponse =
     }
   | null;
 
-type JobData = {
-  outputUrl?: string;
-  status?: string;
-  error?: string;
-  details?: string;
-  url?: string;
-};
-
-// ✅ Importante: en Lovable no dependemos de env vars.
-// Forzamos HTTPS para evitar "Failed to fetch" / mixed content.
+// ✅ Importante: forzamos HTTPS para evitar mixed content
 const API_URL = "https://ai-video-style-bot-3.onrender.com";
 
 // ---------- helpers ----------
@@ -70,7 +61,8 @@ async function uploadOne(file: File): Promise<UploadedFile> {
   };
 }
 
-async function createRenderJob(payload: any): Promise<{ jobId: string }> {
+// ✅ Render directo (sin job/poll)
+async function renderNow(payload: any): Promise<{ outputUrl: string; raw: any }> {
   const res = await fetch(`${API_URL}/render`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -84,21 +76,10 @@ async function createRenderJob(payload: any): Promise<{ jobId: string }> {
     throw new Error(msg);
   }
 
-  const jobId = json?.jobId || json?.id || json?.job_id;
-  if (!jobId) throw new Error("Render response missing jobId");
+  const out = json?.outputUrl || json?.url || json?.videoUrl;
+  if (!out) throw new Error("Render OK pero no devuelve URL (outputUrl/url/videoUrl)");
 
-  return { jobId };
-}
-
-async function pollJob(jobId: string): Promise<JobData> {
-  const res = await fetch(`${API_URL}/job/${encodeURIComponent(jobId)}`);
-  const { json, text } = await readJsonSafe(res);
-
-  if (!res.ok) {
-    const msg = json?.error || text || `Job poll failed (${res.status})`;
-    throw new Error(msg);
-  }
-  return json || {};
+  return { outputUrl: out, raw: json };
 }
 
 async function generatePlan(messages: { role: "user" | "assistant"; content: string }[], context: any) {
@@ -144,13 +125,11 @@ export default function ClipForge() {
 
   // Render states
   const [isRendering, setIsRendering] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
 
   // Debug UI
   const [debugMsg, setDebugMsg] = useState<string>("");
-  const [lastJob, setLastJob] = useState<JobData | null>(null);
-  const [jobStatus, setJobStatus] = useState<string>("idle");
+  const [lastRenderResponse, setLastRenderResponse] = useState<any>(null);
 
   // Refs for file inputs
   const clipInputRef = useRef<HTMLInputElement | null>(null);
@@ -175,7 +154,6 @@ export default function ClipForge() {
 
     try {
       const uploaded: ClipItem[] = [];
-
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
         const up = await uploadOne(f);
@@ -255,9 +233,7 @@ export default function ClipForge() {
     setDebugMsg("");
     setIsRendering(true);
     setOutputUrl(null);
-    setJobId(null);
-    setLastJob(null);
-    setJobStatus("starting");
+    setLastRenderResponse(null);
 
     try {
       const payload: any = {
@@ -279,36 +255,13 @@ export default function ClipForge() {
       if (music?.url) payload.music = { url: music.url, name: music.name };
       if (referenceVideo?.url) payload.referenceVideo = { url: referenceVideo.url, name: referenceVideo.name };
 
-      const { jobId: newJobId } = await createRenderJob(payload);
-      setJobId(newJobId);
-      setJobStatus("processing");
+      setDebugMsg(`🎬 Enviando render payload...\n${JSON.stringify(payload, null, 2).slice(0, 1200)}`);
 
-      const start = Date.now();
+      const { outputUrl: out, raw } = await renderNow(payload);
+      setLastRenderResponse(raw);
+      setOutputUrl(out);
 
-      while (true) {
-        const data = await pollJob(newJobId);
-        setLastJob(data);
-
-        if (data?.status === "done" || data?.status === "completed" || data?.outputUrl || data?.url) {
-          const out = data?.outputUrl || data?.url;
-          if (out) setOutputUrl(out);
-          setJobStatus("done");
-          break;
-        }
-
-        if (data?.status === "error" || data?.error) {
-          setJobStatus("error");
-          const details = data?.details ? `\n\nDetalles:\n${String(data.details).slice(0, 1200)}` : "";
-          throw new Error((data?.error || "Error en render") + details);
-        }
-
-        if (Date.now() - start > 6 * 60 * 1000) {
-          setJobStatus("timeout");
-          throw new Error("Timeout esperando el render");
-        }
-
-        await new Promise((r) => setTimeout(r, 1500));
-      }
+      setDebugMsg(`✅ Render OK!\nSalida: ${out}`);
     } catch (e: any) {
       setDebugMsg(`❌ Render: ${e?.message || "Error renderizando"}`);
       alert(e?.message || "Error renderizando");
@@ -347,9 +300,6 @@ export default function ClipForge() {
               {!outputUrl ? (
                 <div className="h-[320px] md:h-[420px] rounded-lg bg-secondary/40 flex flex-col gap-2 items-center justify-center text-sm text-muted-foreground">
                   <div>{isRendering ? "Renderizando..." : "Aún no hay vídeo renderizado"}</div>
-                  <div className="text-xs">
-                    Estado: <span className="font-mono">{jobStatus}</span>
-                  </div>
                 </div>
               ) : (
                 <video className="w-full rounded-lg bg-black" controls src={outputUrl} />
@@ -366,12 +316,6 @@ export default function ClipForge() {
                   </a>
                 )}
               </div>
-
-              {jobId && (
-                <p className="text-xs text-muted-foreground">
-                  Job: <span className="font-mono">{jobId}</span>
-                </p>
-              )}
             </CardContent>
           </Card>
 
@@ -396,9 +340,9 @@ export default function ClipForge() {
                 <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">{debugMsg}</pre>
               )}
 
-              {lastJob && (
+              {lastRenderResponse && (
                 <pre className="text-xs whitespace-pre-wrap rounded-md bg-secondary/40 p-2">
-                  {JSON.stringify(lastJob, null, 2).slice(0, 1500)}
+                  {JSON.stringify(lastRenderResponse, null, 2).slice(0, 1500)}
                 </pre>
               )}
             </CardContent>
@@ -458,7 +402,8 @@ export default function ClipForge() {
                 <input
                   ref={musicInputRef}
                   type="file"
-                  accept="audio/*"
+                  // ✅ acepta MP3 seguro
+                  accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg"
                   className="hidden"
                   onChange={(e) => handleUploadMusic(e.target.files?.[0] || null)}
                 />
