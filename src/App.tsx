@@ -1,7 +1,7 @@
 import { Toaster } from "@/components/ui/toaster";
 import ClipForge from "@/pages/ClipForge";
 
-function App() {
+export default function App() {
   return (
     <>
       <ClipForge />
@@ -9,5 +9,3 @@ function App() {
     </>
   );
 }
-
-export default App;
