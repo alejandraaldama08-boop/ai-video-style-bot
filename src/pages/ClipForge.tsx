@@ -30,10 +30,8 @@ type JobData = {
   url?: string;
 };
 
-//
-// ✅ IMPORTANTE: Lovable no expone env vars como Vercel,
-// así que fijamos el backend aquí en HTTPS para evitar Mixed Content.
-//
+// ✅ Importante: en Lovable no dependemos de env vars.
+// Forzamos HTTPS para evitar "Failed to fetch" / mixed content.
 const API_URL = "https://ai-video-style-bot-3.onrender.com";
 
 // ---------- helpers ----------
@@ -63,6 +61,7 @@ async function uploadOne(file: File): Promise<UploadedFile> {
   }
 
   if (!json?.url) throw new Error("Upload response missing url");
+
   return {
     url: json.url,
     name: json.name || file.name,
@@ -87,6 +86,7 @@ async function createRenderJob(payload: any): Promise<{ jobId: string }> {
 
   const jobId = json?.jobId || json?.id || json?.job_id;
   if (!jobId) throw new Error("Render response missing jobId");
+
   return { jobId };
 }
 
@@ -137,11 +137,12 @@ export default function ClipForge() {
   // Plan / Chat
   const [plan, setPlan] = useState<PlanResponse>(null);
 
-  // Render
+  // Upload states
   const [isUploadingClips, setIsUploadingClips] = useState(false);
   const [isUploadingMusic, setIsUploadingMusic] = useState(false);
   const [isUploadingRef, setIsUploadingRef] = useState(false);
 
+  // Render states
   const [isRendering, setIsRendering] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
@@ -171,13 +172,16 @@ export default function ClipForge() {
     if (!files || files.length === 0) return;
     setDebugMsg("");
     setIsUploadingClips(true);
+
     try {
       const uploaded: ClipItem[] = [];
+
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
         const up = await uploadOne(f);
         uploaded.push({ url: up.url, name: up.name, order: i, startTime: 0 });
       }
+
       setClips((prev) => {
         const base = prev.slice();
         const startOrder = base.length;
@@ -197,6 +201,7 @@ export default function ClipForge() {
     if (!file) return;
     setDebugMsg("");
     setIsUploadingMusic(true);
+
     try {
       setDebugMsg(
         `🎵 Intentando subir música: ${file.name} (${file.type || "sin mimetype"}, ${(file.size / 1024 / 1024).toFixed(
@@ -226,6 +231,7 @@ export default function ClipForge() {
     if (!file) return;
     setDebugMsg("");
     setIsUploadingRef(true);
+
     try {
       const up = await uploadOne(file);
       setReferenceVideo(up);
@@ -278,6 +284,7 @@ export default function ClipForge() {
       setJobStatus("processing");
 
       const start = Date.now();
+
       while (true) {
         const data = await pollJob(newJobId);
         setLastJob(data);
@@ -373,10 +380,9 @@ export default function ClipForge() {
 
         {/* Right: Inputs + Chat */}
         <div className="lg:col-span-5 space-y-4">
-          {/* Temporal: store test */}
           <StoreSmokeTest />
 
-          {/* Debug */}
+          {/* Debug card */}
           <Card className="glass neon-border">
             <CardHeader>
               <CardTitle className="text-lg">Debug</CardTitle>
@@ -482,6 +488,7 @@ export default function ClipForge() {
                   className="hidden"
                   onChange={(e) => handleUploadReference(e.target.files?.[0] || null)}
                 />
+
                 <Button
                   variant="secondary"
                   className="w-full"
@@ -532,7 +539,13 @@ export default function ClipForge() {
 
                 <div className="space-y-2">
                   <div className="text-sm text-muted-foreground">Duración (s)</div>
-                  <Input value={duration} type="number" min={5} max={300} onChange={(e) => setDuration(Number(e.target.value || 30))} />
+                  <Input
+                    value={duration}
+                    type="number"
+                    min={5}
+                    max={300}
+                    onChange={(e) => setDuration(Number(e.target.value || 30))}
+                  />
                 </div>
               </div>
             </CardContent>
