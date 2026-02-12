@@ -15,7 +15,7 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "50mb" }));
 app.use(
   cors({
-    origin: true, // si quieres más estricto, te lo dejo luego fijado a tu dominio lovableproject
+    origin: true,
     credentials: false,
   })
 );
@@ -26,7 +26,6 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// buckets (ya los creaste)
 const BUCKET_UPLOADS = process.env.SUPABASE_BUCKET_UPLOADS || "uploads";
 const BUCKET_RENDERS = process.env.SUPABASE_BUCKET_RENDERS || "renders";
 
@@ -41,18 +40,18 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 // --------- helpers ---------
-function extFromName(name = "") {
-  const ext = path.extname(name).toLowerCase();
-  return ext && ext.length <= 8 ? ext : "";
-}
-
 function randId() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-function publicUrl(bucket, objectPath) {
-  // URL pública estándar Supabase Storage (bucket debe ser PUBLIC)
-  return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${objectPath}`;
+function safeFilename(original = "file") {
+  return original.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function getPublicUrl(bucket, objectPath) {
+  // ✅ Usar API oficial para URL pública
+  const { data } = supabase.storage.from(bucket).getPublicUrl(objectPath);
+  return data.publicUrl;
 }
 
 async function ensureTmpDir(dir) {
@@ -80,23 +79,18 @@ function run(cmd, args, opts = {}) {
   });
 }
 
-function safeFilename(original = "file") {
-  return original.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
 // --------- Multer (memory) ---------
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 1024 * 1024 * 200 }, // 200MB (ajusta si quieres)
+  limits: { fileSize: 1024 * 1024 * 200 }, // 200MB
 });
 
 // --------- In-memory jobs ---------
 const jobs = new Map(); // jobId -> { status, url?, error?, details? }
 
 // --------- ROUTES ---------
-
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "render-backend", ffmpeg: !!ffmpegPath });
+  res.json({ ok: true, service: "render-backend", ffmpeg: !!ffmpegPath, ffmpegPath });
 });
 
 /**
@@ -111,8 +105,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!file) return res.status(400).json({ error: "No file" });
 
     const original = safeFilename(file.originalname || "upload");
-    const ext = extFromName(original) || "";
-    const objectPath = `${Date.now()}-${randId()}-${original || "file"}${ext && !original.endsWith(ext) ? ext : ""}`;
+    // ✅ FIX #1: NO duplicar extensión, usar original tal cual
+    const objectPath = `${Date.now()}-${randId()}-${original}`;
 
     const contentType = file.mimetype || "application/octet-stream";
 
@@ -125,7 +119,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     if (error) throw new Error(`Supabase upload error: ${error.message}`);
 
-    const url = publicUrl(BUCKET_UPLOADS, objectPath);
+    // ✅ FIX #2: URL pública robusta
+    const url = getPublicUrl(BUCKET_UPLOADS, objectPath);
 
     res.json({
       url,
@@ -147,7 +142,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
  *  format: "tiktok" | "reels" | "youtube",
  *  duration: number
  * }
- * -> crea job y procesa async (pero en el mismo proceso)
+ * -> crea job y procesa async (en el mismo proceso Node)
  */
 app.post("/render", async (req, res) => {
   const jobId = randId();
@@ -156,9 +151,10 @@ app.post("/render", async (req, res) => {
   // respondemos rápido
   res.json({ jobId });
 
-  // procesamos en background (en el mismo proceso Node)
   (async () => {
     const startedAt = Date.now();
+    let workDir = null;
+
     try {
       jobs.set(jobId, { status: "processing" });
 
@@ -166,27 +162,24 @@ app.post("/render", async (req, res) => {
       if (!Array.isArray(clips) || clips.length === 0) {
         throw new Error("No clips provided");
       }
-
       if (!ffmpegPath) {
         throw new Error("ffmpeg-static not available (ffmpegPath missing)");
       }
 
-      // carpeta temporal
-      const workDir = path.join(os.tmpdir(), `job-${jobId}`);
+      workDir = path.join(os.tmpdir(), `job-${jobId}`);
       await ensureTmpDir(workDir);
 
       // 1) descargar clips
+      const sorted = clips.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       const localClips = [];
-      const sorted = clips
-        .slice()
-        .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
       for (let i = 0; i < sorted.length; i++) {
         const c = sorted[i];
         if (!c?.url) throw new Error(`Clip missing url at index ${i}`);
 
+        // si no viene name, ponemos mp4 por defecto
         const name = safeFilename(c.name || `clip-${i}.mp4`);
-        const ext = extFromName(name) || ".mp4";
+        const ext = path.extname(name) || ".mp4";
         const outPath = path.join(workDir, `clip-${String(i).padStart(3, "0")}${ext}`);
 
         await downloadToFile(c.url, outPath);
@@ -197,22 +190,20 @@ app.post("/render", async (req, res) => {
       let localMusic = null;
       if (music?.url) {
         const mname = safeFilename(music.name || "music.mp3");
-        const mext = extFromName(mname) || ".mp3";
+        const mext = path.extname(mname) || ".mp3";
         localMusic = path.join(workDir, `music${mext}`);
         await downloadToFile(music.url, localMusic);
       }
 
-      // 3) concat (demuxer)
-      // Creamos filelist.txt
+      // 3) concat: SIEMPRE re-encode (más estable)
       const listPath = path.join(workDir, "filelist.txt");
       const listContent = localClips.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
       await fs.promises.writeFile(listPath, listContent);
 
-      const outName = `render-${jobId}.mp4`;
-      const outLocal = path.join(workDir, outName);
-
-      // Concat base:
       const concatTmp = path.join(workDir, `concat-${jobId}.mp4`);
+
+      // ✅ FIX #3: NO usar -c copy (rompe con clips distintos)
+      // OJO: si Render te da "Unknown encoder libx264", te pongo alternativa abajo.
       await run(ffmpegPath, [
         "-y",
         "-f",
@@ -221,17 +212,24 @@ app.post("/render", async (req, res) => {
         "0",
         "-i",
         listPath,
-        "-c",
-        "copy",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
         concatTmp,
       ]);
 
-      // 4) recortar duración + añadir música opcional
-      // Nota: para máxima compatibilidad, re-encodeamos aquí.
-      const dur = Number(duration) || 30;
+      // 4) recortar duración + música opcional
+      const dur = Math.max(1, Number(duration) || 30);
+      const outLocal = path.join(workDir, `render-${jobId}.mp4`);
 
       if (localMusic) {
-        // video + audio
         await run(ffmpegPath, [
           "-y",
           "-i",
@@ -258,7 +256,6 @@ app.post("/render", async (req, res) => {
           outLocal,
         ]);
       } else {
-        // solo video (mantiene audio original si hay, si no, sin audio)
         await run(ffmpegPath, [
           "-y",
           "-i",
@@ -289,7 +286,7 @@ app.post("/render", async (req, res) => {
       });
       if (error) throw new Error(`Supabase render upload error: ${error.message}`);
 
-      const url = publicUrl(BUCKET_RENDERS, objectPath);
+      const url = getPublicUrl(BUCKET_RENDERS, objectPath);
 
       jobs.set(jobId, {
         status: "done",
@@ -297,9 +294,6 @@ app.post("/render", async (req, res) => {
         outputUrl: url,
         tookMs: Date.now() - startedAt,
       });
-
-      // limpieza best-effort
-      fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
     } catch (e) {
       console.error("❌ render job error:", e);
       jobs.set(jobId, {
@@ -307,13 +301,17 @@ app.post("/render", async (req, res) => {
         error: String(e?.message || e),
         details: String(e?.stack || ""),
       });
+    } finally {
+      // limpieza best-effort
+      if (workDir) {
+        fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   })();
 });
 
 /**
  * GET /job/:id
- * -> devuelve status y url si está listo
  */
 app.get("/job/:id", (req, res) => {
   const id = req.params.id;
@@ -324,5 +322,6 @@ app.get("/job/:id", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`✅ render-backend listening on :${PORT}`);
+  console.log(`✅ ffmpegPath: ${ffmpegPath}`);
   console.log(`✅ buckets: uploads=${BUCKET_UPLOADS}, renders=${BUCKET_RENDERS}`);
 });
