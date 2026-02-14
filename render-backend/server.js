@@ -9,6 +9,13 @@ import { createClient } from "@supabase/supabase-js";
 import ffmpegPath from "ffmpeg-static";
 import { spawn } from "child_process";
 
+// ✅ FIX: asegurar fetch global (evita "Supabase upload error: fetch failed" en Render)
+import { fetch, Headers, Request, Response } from "undici";
+globalThis.fetch = fetch;
+globalThis.Headers = Headers;
+globalThis.Request = Request;
+globalThis.Response = Response;
+
 const app = express();
 app.set("trust proxy", 1);
 
@@ -37,6 +44,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
+  global: { fetch }, // ✅ usar fetch de undici explícitamente
 });
 
 // --------- helpers ---------
@@ -49,7 +57,6 @@ function safeFilename(original = "file") {
 }
 
 function getPublicUrl(bucket, objectPath) {
-  // ✅ Usar API oficial para URL pública
   const { data } = supabase.storage.from(bucket).getPublicUrl(objectPath);
   return data.publicUrl;
 }
@@ -90,7 +97,15 @@ const jobs = new Map(); // jobId -> { status, url?, error?, details? }
 
 // --------- ROUTES ---------
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "render-backend", ffmpeg: !!ffmpegPath, ffmpegPath });
+  res.json({
+    ok: true,
+    service: "render-backend",
+    node: process.version,
+    hasFetch: typeof fetch === "function",
+    ffmpeg: !!ffmpegPath,
+    ffmpegPath,
+    buckets: { uploads: BUCKET_UPLOADS, renders: BUCKET_RENDERS },
+  });
 });
 
 /**
@@ -104,33 +119,58 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file" });
 
-    const original = safeFilename(file.originalname || "upload");
-    // ✅ FIX #1: NO duplicar extensión, usar original tal cual
-    const objectPath = `${Date.now()}-${randId()}-${original}`;
+    console.log("---- /upload ----");
+    console.log("Node:", process.version);
+    console.log("SUPABASE_URL:", SUPABASE_URL ? "OK" : "MISSING");
+    console.log("SERVICE_ROLE_KEY:", SUPABASE_SERVICE_ROLE_KEY ? "OK" : "MISSING");
+    console.log("Bucket:", BUCKET_UPLOADS);
+    console.log("File:", file.originalname, file.mimetype, file.size);
 
+    // asegurar que existe buffer (memoryStorage)
+    if (!file.buffer || file.buffer.length === 0) {
+      return res.status(500).json({
+        error: "file.buffer vacío (multer memoryStorage no está funcionando)",
+      });
+    }
+
+    const original = safeFilename(file.originalname || "upload");
+    const objectPath = `${Date.now()}-${randId()}-${original}`;
     const contentType = file.mimetype || "application/octet-stream";
 
-    const { error } = await supabase.storage
+    const { data, error } = await supabase.storage
       .from(BUCKET_UPLOADS)
       .upload(objectPath, file.buffer, {
         contentType,
         upsert: false,
       });
 
-    if (error) throw new Error(`Supabase upload error: ${error.message}`);
+    if (error) {
+      console.error("❌ Supabase upload error object:", error);
+      return res.status(500).json({
+        error: "Supabase upload error",
+        message: error.message,
+        statusCode: error.statusCode,
+        name: error.name,
+        details: error,
+      });
+    }
 
-    // ✅ FIX #2: URL pública robusta
     const url = getPublicUrl(BUCKET_UPLOADS, objectPath);
 
-    res.json({
+    return res.json({
       url,
       name: original,
       mimetype: file.mimetype,
       size: file.size,
+      objectPath,
+      storage: data,
     });
   } catch (e) {
     console.error("❌ /upload error:", e);
-    res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({
+      error: String(e?.message || e),
+      stack: String(e?.stack || ""),
+    });
   }
 });
 
@@ -177,7 +217,6 @@ app.post("/render", async (req, res) => {
         const c = sorted[i];
         if (!c?.url) throw new Error(`Clip missing url at index ${i}`);
 
-        // si no viene name, ponemos mp4 por defecto
         const name = safeFilename(c.name || `clip-${i}.mp4`);
         const ext = path.extname(name) || ".mp4";
         const outPath = path.join(workDir, `clip-${String(i).padStart(3, "0")}${ext}`);
@@ -202,8 +241,6 @@ app.post("/render", async (req, res) => {
 
       const concatTmp = path.join(workDir, `concat-${jobId}.mp4`);
 
-      // ✅ FIX #3: NO usar -c copy (rompe con clips distintos)
-      // OJO: si Render te da "Unknown encoder libx264", te pongo alternativa abajo.
       await run(ffmpegPath, [
         "-y",
         "-f",
@@ -284,6 +321,7 @@ app.post("/render", async (req, res) => {
         contentType: "video/mp4",
         upsert: false,
       });
+
       if (error) throw new Error(`Supabase render upload error: ${error.message}`);
 
       const url = getPublicUrl(BUCKET_RENDERS, objectPath);
@@ -302,7 +340,6 @@ app.post("/render", async (req, res) => {
         details: String(e?.stack || ""),
       });
     } finally {
-      // limpieza best-effort
       if (workDir) {
         fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
       }
@@ -322,6 +359,8 @@ app.get("/job/:id", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`✅ render-backend listening on :${PORT}`);
+  console.log(`✅ Node: ${process.version}`);
+  console.log(`✅ fetch available: ${typeof fetch === "function"}`);
   console.log(`✅ ffmpegPath: ${ffmpegPath}`);
   console.log(`✅ buckets: uploads=${BUCKET_UPLOADS}, renders=${BUCKET_RENDERS}`);
 });
