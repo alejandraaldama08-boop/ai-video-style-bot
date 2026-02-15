@@ -5,6 +5,7 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import crypto from "crypto";
+import dns from "dns/promises";
 import { createClient } from "@supabase/supabase-js";
 import ffmpegPath from "ffmpeg-static";
 import { spawn } from "child_process";
@@ -20,16 +21,18 @@ app.use(
   })
 );
 
-// --------- ENV ---------
+// ======================
+// ENV
+// ======================
 const PORT = process.env.PORT || 3000;
 
+// ✅ trim para evitar espacios/saltos invisibles
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
 const BUCKET_UPLOADS = (process.env.SUPABASE_BUCKET_UPLOADS || "uploads").trim();
 const BUCKET_RENDERS = (process.env.SUPABASE_BUCKET_RENDERS || "renders").trim();
 
-// seguridad mínima
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en env.");
   process.exit(1);
@@ -39,7 +42,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// --------- helpers ---------
+// ======================
+// Helpers
+// ======================
 function randId() {
   return crypto.randomBytes(16).toString("hex");
 }
@@ -67,9 +72,9 @@ async function downloadToFile(url, outPath) {
   await fs.promises.writeFile(outPath, buf);
 }
 
-function run(cmd, args, opts = {}) {
+function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "inherit", ...opts });
+    const p = spawn(cmd, args, { stdio: "inherit" });
     p.on("error", reject);
     p.on("close", (code) => {
       if (code === 0) resolve();
@@ -78,21 +83,24 @@ function run(cmd, args, opts = {}) {
   });
 }
 
-// --------- Multer (memory) ---------
+// ======================
+// Multer (memoryStorage)
+// ======================
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 1024 * 1024 * 200 }, // 200MB
 });
 
-// --------- In-memory jobs ---------
-const jobs = new Map(); // jobId -> { status, url?, error?, details? }
+// ======================
+// Jobs in memory
+// ======================
+const jobs = new Map();
 
-// --------- STATIC (optional) ---------
-app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
-app.use("/renders", express.static(path.join(process.cwd(), "renders")));
+// ======================
+// ROUTES
+// ======================
 
-// --------- ROUTES ---------
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "render-backend",
@@ -104,74 +112,53 @@ app.get("/", (req, res) => {
   });
 });
 
-/**
- * DIAGNÓSTICO: ¿Render puede llegar a Supabase?
- * Abre: https://TU-SERVICIO.onrender.com/diag-supabase
- */
-app.get("/diag-supabase", async (req, res) => {
+// ✅ DEBUG: DNS + fetch contra Supabase
+app.get("/debug-supabase", async (_req, res) => {
   try {
-    const testUrl = `${SUPABASE_URL}/auth/v1/health`;
-    const r = await fetch(testUrl, { method: "GET" });
-    const text = await r.text();
+    const host = new URL(SUPABASE_URL).host;
+    const dnsResult = await dns.lookup(host);
+
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/health`, { method: "GET" });
+    const text = await r.text().catch(() => "");
 
     res.json({
       ok: true,
       supabaseUrl: SUPABASE_URL,
-      testUrl,
-      status: r.status,
-      body: text.slice(0, 300),
+      host,
+      dns: dnsResult,
+      fetchStatus: r.status,
+      preview: text.slice(0, 200),
     });
   } catch (e) {
     res.status(500).json({
       ok: false,
       supabaseUrl: SUPABASE_URL,
       error: String(e?.message || e),
-      cause: e?.cause ? String(e.cause) : null,
+      cause: String(e?.cause || ""),
     });
   }
 });
 
-/**
- * POST /upload
- * form-data: file
- * -> sube a Supabase Storage bucket uploads
- * -> devuelve { url, name, mimetype, size, bucket, objectPath }
- */
+// UPLOAD
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
-
-    // Logs mínimos (diagnóstico)
-    console.log("---- /upload ----");
-    console.log("SUPABASE_URL:", SUPABASE_URL);
-    console.log("BUCKET_UPLOADS:", BUCKET_UPLOADS);
-    console.log("has file:", !!file);
-
     if (!file) return res.status(400).json({ error: "No file" });
 
     if (!file.buffer || file.buffer.length === 0) {
-      return res.status(500).json({
-        error: "File buffer is empty",
-        hint: "Check multer memoryStorage()",
-      });
+      return res.status(500).json({ error: "File buffer vacío (multer memoryStorage)" });
     }
 
     const original = safeFilename(file.originalname || "upload.bin");
     const objectPath = `${Date.now()}-${randId()}-${original}`;
     const contentType = file.mimetype || "application/octet-stream";
 
-    console.log("Uploading objectPath:", objectPath);
-    console.log("contentType:", contentType, "size:", file.size);
-
-    const { data, error } = await supabase.storage
-      .from(BUCKET_UPLOADS)
-      .upload(objectPath, file.buffer, {
-        contentType,
-        upsert: false,
-      });
+    const { error } = await supabase.storage.from(BUCKET_UPLOADS).upload(objectPath, file.buffer, {
+      contentType,
+      upsert: false,
+    });
 
     if (error) {
-      // MUY IMPORTANTE: devolver info real del error
       console.error("SUPABASE UPLOAD ERROR RAW:", error);
       return res.status(500).json({
         error: "Supabase upload error",
@@ -184,7 +171,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     const url = getPublicUrl(BUCKET_UPLOADS, objectPath);
 
-    console.log("✅ Upload OK:", url);
     res.json({
       url,
       name: original,
@@ -192,10 +178,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       size: file.size,
       bucket: BUCKET_UPLOADS,
       objectPath,
-      data,
     });
   } catch (e) {
-    console.error("❌ /upload crash:", e);
     res.status(500).json({
       error: "Upload crash",
       message: String(e?.message || e),
@@ -204,31 +188,26 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-/**
- * POST /render
- * body: { clips: [{ url, name?, order? }], music?: { url, name? }, duration?: number }
- * -> crea job y procesa async
- */
+// RENDER
 app.post("/render", async (req, res) => {
   const jobId = randId();
   jobs.set(jobId, { status: "starting" });
   res.json({ jobId });
 
   (async () => {
-    const startedAt = Date.now();
     let workDir = null;
+    const startedAt = Date.now();
 
     try {
       jobs.set(jobId, { status: "processing" });
 
       const { clips = [], music = null, duration = 30 } = req.body || {};
       if (!Array.isArray(clips) || clips.length === 0) throw new Error("No clips provided");
-      if (!ffmpegPath) throw new Error("ffmpeg-static not available (ffmpegPath missing)");
+      if (!ffmpegPath) throw new Error("ffmpeg-static missing");
 
       workDir = path.join(os.tmpdir(), `job-${jobId}`);
       await ensureTmpDir(workDir);
 
-      // 1) descargar clips
       const sorted = clips.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       const localClips = [];
 
@@ -244,7 +223,6 @@ app.post("/render", async (req, res) => {
         localClips.push(outPath);
       }
 
-      // 2) descargar música
       let localMusic = null;
       if (music?.url) {
         const mname = safeFilename(music.name || "music.mp3");
@@ -253,7 +231,6 @@ app.post("/render", async (req, res) => {
         await downloadToFile(music.url, localMusic);
       }
 
-      // 3) concat (re-encode)
       const listPath = path.join(workDir, "filelist.txt");
       const listContent = localClips.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
       await fs.promises.writeFile(listPath, listContent);
@@ -281,7 +258,6 @@ app.post("/render", async (req, res) => {
         concatTmp,
       ]);
 
-      // 4) duración + música opcional
       const dur = Math.max(1, Number(duration) || 30);
       const outLocal = path.join(workDir, `render-${jobId}.mp4`);
 
@@ -332,7 +308,6 @@ app.post("/render", async (req, res) => {
         ]);
       }
 
-      // 5) subir render a Supabase bucket renders
       const outBuf = await fs.promises.readFile(outLocal);
       const objectPath = `${Date.now()}-${jobId}.mp4`;
 
@@ -341,47 +316,29 @@ app.post("/render", async (req, res) => {
         upsert: false,
       });
 
-      if (error) {
-        console.error("SUPABASE RENDER UPLOAD ERROR RAW:", error);
-        throw new Error(`Supabase render upload error: ${error.message}`);
-      }
+      if (error) throw new Error(`Supabase render upload error: ${error.message}`);
 
       const url = getPublicUrl(BUCKET_RENDERS, objectPath);
 
-      jobs.set(jobId, {
-        status: "done",
-        url,
-        outputUrl: url,
-        tookMs: Date.now() - startedAt,
-      });
+      jobs.set(jobId, { status: "done", outputUrl: url, tookMs: Date.now() - startedAt });
     } catch (e) {
-      console.error("❌ render job error:", e);
-      jobs.set(jobId, {
-        status: "error",
-        error: String(e?.message || e),
-        details: String(e?.stack || ""),
-      });
+      jobs.set(jobId, { status: "error", error: String(e?.message || e), details: String(e?.stack || "") });
     } finally {
-      if (workDir) {
-        fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
-      }
+      if (workDir) fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
   })();
 });
 
-/**
- * GET /job/:id
- */
+// JOB STATUS
 app.get("/job/:id", (req, res) => {
-  const id = req.params.id;
-  const data = jobs.get(id);
+  const data = jobs.get(req.params.id);
   if (!data) return res.status(404).json({ status: "not_found" });
   res.json(data);
 });
 
 app.listen(PORT, () => {
   console.log(`✅ render-backend listening on :${PORT}`);
-  console.log(`✅ ffmpegPath: ${ffmpegPath}`);
-  console.log(`✅ buckets: uploads=${BUCKET_UPLOADS}, renders=${BUCKET_RENDERS}`);
   console.log(`✅ SUPABASE_URL: ${SUPABASE_URL}`);
+  console.log(`✅ buckets: uploads=${BUCKET_UPLOADS}, renders=${BUCKET_RENDERS}`);
+  console.log(`✅ ffmpegPath: ${ffmpegPath}`);
 });
